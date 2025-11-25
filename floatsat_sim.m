@@ -60,23 +60,36 @@ function params = setup_params()
   % motor torque limits
   params.FLYWHEEL.torque_max = [0.2, 0.2, 0.2]; % N·m (example values)
 
-  % Geometry: wheel mount positions (r_i) and wheel spin axes (n_i) in body frame.
-  % Each row is a vector [x,y,z]. These are separate physical quantities.
-  params.WHEEL_POS = [ 0.0633, 0.0, 0.0;   % wheel 1 position (m)
-                       0.0, 0.0633, 0.0;   % wheel 2 position
-                       0.0, 0.0, -0.0633 ]; % wheel 3 position
-  % Wheel spin axes (unit vectors). For tilted wheels set appropriate vectors (unitized).
-  % params.WHEEL_AXIS = [ 0.8165, -0.4083, -0.4083;
-  %                       -0.7071, 0.7071, -0.7071;
-  %                       0.5773, 0.5773, -0.5773 ];
+  tilt_deg = 54.736;        % angle from Z-axis
+  tilt_rad = deg2rad(tilt_deg);
 
-  params.WHEEL_AXIS = [ 1, 0, 0;
-                        0, 1, 0;
-                        0, 0, 1 ];
+  azimuth_deg = [0, 120, 240];   % wheel azimuths in XY plane
+  azimuth_rad = deg2rad(azimuth_deg);
 
-  params.I_body = [ 0.1, 0, 0;
-                    0, 0.1, 0;
-                    0, 0, 0.1 ];  % kg·m^2
+  r_mount = 0.0633;   % distance from body center in XY plane
+  z_offset = -0.0633; % slightly below body center along Z
+
+  wheel_pos = zeros(3,3); % 3 wheels x 3 components
+  wheel_axis = zeros(3,3);
+
+  for i = 1:3
+      az = azimuth_rad(i);
+      wheel_pos(i,1) = r_mount * cos(az);  % X
+      wheel_pos(i,2) = r_mount * sin(az);  % Y
+      wheel_pos(i,3) = z_offset;            % Z
+  end
+
+  for i = 1:3
+      vec = -wheel_pos(i,:);  % vector from wheel to center
+      wheel_axis(i,:) = vec / norm(vec);  % normalize
+  end
+
+  params.WHEEL_POS  = wheel_pos;
+  params.WHEEL_AXIS = wheel_axis;
+
+  params.I_body = [ 1, 0, 0;
+                    0, 1, 0;
+                    0, 0, 1 ];  % kg·m^2
   params.I_body_inv = inv(params.I_body);
 
   % Make params easier to pass to comp_step
