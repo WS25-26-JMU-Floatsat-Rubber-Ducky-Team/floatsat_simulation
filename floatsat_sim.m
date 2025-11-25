@@ -6,6 +6,7 @@ function main()
   state  = setup_state(params);
   [state, params] = run_simulation(state, params);
   plot_results(state, params);
+  plot_3d_floatsat(state);
   pause();
 endfunction
 
@@ -34,9 +35,9 @@ function params = setup_params()
   params.INITIAL_YAW = 0.0;
 
   % PID tuning (per-axis)
-  params.PID.Kp = [0.8, 0.8, 0.8];
+  params.PID.Kp = [0.2, 0.2, 0.2];
   params.PID.Ki = [0.05, 0.05, 0.05];
-  params.PID.Kd = [0.01, 0.01, 0.01];
+  params.PID.Kd = [0.1, 0.1, 0.1];
   params.PID.tau_D = 0.02;
   params.PID.integrator_min_frac = -0.5;  % fraction of actuator max (scaled later)
   params.PID.integrator_max_frac =  0.5;
@@ -49,12 +50,34 @@ function params = setup_params()
 
   % Setpoint: change at 1 second
   params.SETPOINT_STEP_TIME = 1.0;
-  params.SETPOINT_DEG = [10, -5, 20]; % [roll, pitch, yaw] in degrees after step
+  params.SETPOINT_DEG = [30, -5, 10]; % [roll, pitch, yaw] in degrees after step
 
   % Flywheel actuator parameters
-  params.FLYWHEEL.Jw = [0.01, 0.01, 0.01];    % kg·m^2, moment of inertia per axis
-  params.FLYWHEEL.angvel_max = deg2rad([500, 500, 500]); % rad/s max wheel speed
-  params.FLYWHEEL.torque_max = deg2rad([50, 50, 50]);    % rad/s^2 equivalent torque limit
+  % per-wheel rotational inertia (kg·m^2). Measure or compute from geometry.
+  params.FLYWHEEL.Jw = [0.01, 0.01, 0.01];
+  % maximum wheel spin rate (rad/s)
+  params.FLYWHEEL.wheel_angvel_max = [rpm2rads(900), rpm2rads(900), rpm2rads(900)]; % rad/s
+  % motor torque limits
+  params.FLYWHEEL.torque_max = [0.2, 0.2, 0.2]; % N·m (example values)
+
+  % Geometry: wheel mount positions (r_i) and wheel spin axes (n_i) in body frame.
+  % Each row is a vector [x,y,z]. These are separate physical quantities.
+  params.WHEEL_POS = [ 0.0633, 0.0, 0.0;   % wheel 1 position (m)
+                       0.0, 0.0633, 0.0;   % wheel 2 position
+                       0.0, 0.0, 0.0633 ]; % wheel 3 position
+  % Wheel spin axes (unit vectors). For tilted wheels set appropriate vectors (unitized).
+  params.WHEEL_AXIS = [ 0.8165, -0.4083, -0.4083;
+                        0, 0.7071, -0.7071;
+                        0.5773, 0.5773, 0.5773 ];
+
+  % params.WHEEL_AXIS = [ 1, 0, 0;
+  %                       0, 1, 0;
+  %                       0, 0, 1];
+
+  params.I_body = [ 0.05, -0.001, 0.002;
+                    -0.001, 0.06, -0.003;
+                     0.002, -0.003, 0.08 ];  % kg·m^2
+  params.I_body_inv = inv(params.I_body);
 
   % Make params easier to pass to comp_step
   params.comp.DT = params.DT;
@@ -101,6 +124,12 @@ function state = setup_state(params)
   state.torque_wheel_actual = zeros(N,3);   % torque actually applied by wheel
   state.torque_wheel_desired = zeros(N,3);  % PID-desired torque on body
 
+  % Wheel speeds over time (N×3) and motor torque command history
+  state.wheel_angvel = zeros(N,3);         % rad/s, wheel spin rates logged
+  state.tau_motor_cmd = zeros(N,3);        % commanded motor torque (N·m)
+  % initial wheel speed (0)
+  state.wheel_angvel(1,:) = [0,0,0];
+
   % Initial true state: level + initial yaw
   state.angle_true(1,:) = [0, 0, params.INITIAL_YAW];
   state.angvel_true(1,:) = [0,0,0];
@@ -116,9 +145,11 @@ function state = setup_state(params)
   state.Qf(1,:) = eul2quat(state.roll_f(1), state.pitch_f(1), state.yaw_f(1));
   state.Qf(1,:) = normalize_quat(state.Qf(1,:));
 
+  state.Q_true = state.Qf(1,:);  % true attitude quaternion
+
   % Scale integrator limits based on actuator
-  state.PID_integrator_min = params.PID.integrator_min_frac * params.ACTUATOR_MAX_ANGVEL;
-  state.PID_integrator_max = params.PID.integrator_max_frac * params.ACTUATOR_MAX_ANGVEL;
+  state.PID_integrator_min = params.PID.integrator_min_frac * 1;
+  state.PID_integrator_max = params.PID.integrator_max_frac * 1;
 endfunction
 
 % -------------------------------------------------------------------------
@@ -130,71 +161,97 @@ function [state, params] = run_simulation(state, params)
   EPS = params.EPS;
 
   for k = 2:N
-    % Sensors sample the true plant
-    state.gyr_meas(k,:) = state.angvel_true(k-1,:);
-    state.acc_meas(k,:) = true_accel_from_euler(state.angle_true(k-1,1), state.angle_true(k-1,2), state.angle_true(k-1,3), params.G);
-
-    % Filter: fused estimate from sensors
-    [rf, pf, yf, qf] = comp_step(state.roll_f(k-1), state.pitch_f(k-1), state.yaw_f(k-1), state.gyr_meas(k,:), state.acc_meas(k,:), params.comp);
-    state.roll_f(k) = rf; state.pitch_f(k) = pf; state.yaw_f(k) = yf; state.Qf(k,:) = qf;
-
-    % Controller (PID) uses the FILTERED measurements
+    % Controller (PID) produces desired body torque (tau_desired_body)
     sp = state.setpoint(k,:);
+    [rf, pf, yf, qf] = comp_step(state.roll_f(k-1), state.pitch_f(k-1), state.yaw_f(k-1), state.gyr_meas(k,:), state.acc_meas(k,:), params.comp);
     meas = [rf, pf, yf];
+    % We'll treat PID output as a desired body torque (N·m). Convert units by tuning Ki/Kp accordingly.
+    tau_desired_body = zeros(3,1);
     for axis = 1:3
       err = wrap_angle(sp(axis) - meas(axis));
-
-      % P
       P = params.PID.Kp(axis) * err;
-
-      % I (with clamping)
       state.pid.integrator(axis) = state.pid.integrator(axis) + err * DT * params.PID.Ki(axis);
-      % clamp integrator
       state.pid.integrator(axis) = clamp(state.pid.integrator(axis), state.PID_integrator_min, state.PID_integrator_max);
       I = state.pid.integrator(axis);
-
-      % D (filtered derivative)
       derivative_raw = (err - state.pid.prev_error(axis)) / DT;
       tau = params.PID.tau_D;
       D_filtered = (tau * state.pid.prev_derivative(axis) + DT * derivative_raw) / (tau + DT);
       state.pid.prev_derivative(axis) = D_filtered;
       state.pid.prev_error(axis) = err;
       D = params.PID.Kd(axis) * D_filtered;
-
-      % PID -> commanded angular velocity (rad/s)
+      % u is treated as desired body torque on that axis (N·m). Tune gains accordingly.
       u = P + I + D;
-      state.cmd_angvel(k, axis) = u;
+      tau_desired_body(axis) = u;
+      state.cmd_angvel(k, axis) = 0; % keep for legacy plots; not used for dynamics now
     endfor
 
-    for axis = 1:3
-        % Desired angular velocity from PID
-        omega_desired = state.cmd_angvel(k, axis);
+    % Torque allocation: map desired body torque to motor torques
+    % Reaction torque from motor i is -tau_motor_i * n_i (n_i is wheel axis unit vector)
+    % Solve: -N * tau_motor = tau_desired_body  => tau_motor = -pinv(N) * tau_desired_body
+    % where N = [n1 n2 n3] (3x3), column i = axis_i
+    Nmat = params.WHEEL_AXIS'; % 3x3 where column i is axis vector for wheel i
+    % small regularization to avoid singularities
+    reg = 1e-6;
+    tau_motor = -pinv(Nmat' * Nmat + reg * eye(3)) * Nmat' * tau_desired_body;
+    % clamp motor torques to motor limits
+    for i = 1:3
+      % tau_motor(i) = clamp(tau_motor(i), -params.FLYWHEEL.torque_max(i), params.FLYWHEEL.torque_max(i));
+    endfor
+    state.tau_motor_cmd(k,:) = tau_motor';
 
-        % Current body angular velocity
-        omega_current = state.angvel_true(k-1, axis);
-
-        % Compute desired acceleration to reach omega_desired
-        alpha_desired = (omega_desired - omega_current) / DT;
-
-        % Convert to torque
-        I_body = 1.0;   % body inertia
-        state.torque_wheel_desired(k, axis) = -I_body * alpha_desired; % desired torque before clamping
-        tau_body = clamp(I_body * alpha_desired, -params.FLYWHEEL.torque_max(axis), params.FLYWHEEL.torque_max(axis));
-        state.torque_wheel_actual(k, axis) = -tau_body;  % torque applied by wheel
-
-        % Update body angular velocity
-        state.angvel_true(k, axis) = omega_current + (tau_body / I_body) * DT;
-
-        % Update body angle
-        state.angle_true(k, axis) = wrap_angle(state.angle_true(k-1, axis) + state.angvel_true(k, axis) * DT);
+    % Integrate wheel dynamics: Jw * wdot = tau_motor - tau_fric (simple friction optional)
+    Jw_vec = params.FLYWHEEL.Jw(:);
+    wheel_w_prev = state.wheel_angvel(k-1, :)';
+    wheel_w_dot = zeros(3,1);
+    for i = 1:3
+      % optional simple viscous friction coefficient (small)
+      b = 1e-3;
+      wheel_w_dot(i) = (tau_motor(i) - b * wheel_w_prev(i)) / Jw_vec(i);
+      state.wheel_angvel(k,i) = wheel_w_prev(i) + wheel_w_dot(i) * DT;
+      % enforce wheel speed limits
+      state.wheel_angvel(k,i) = clamp(state.wheel_angvel(k,i), -params.FLYWHEEL.wheel_angvel_max(i), params.FLYWHEEL.wheel_angvel_max(i));
     endfor
 
-    % Plant integration (angles)
-    state.angle_true(k, :) = state.angle_true(k-1, :) + state.angvel_true(k, :) * DT;
-    state.angle_true(k,1) = wrap_angle(state.angle_true(k,1));
-    state.angle_true(k,2) = wrap_angle(state.angle_true(k,2));
-    state.angle_true(k,3) = wrap_angle(state.angle_true(k,3));
-  endfor
+    % Reaction torque on body from wheels (sum of -tau_motor_i * n_i)
+    tau_from_wheels = zeros(3,1);
+    for i = 1:3
+      ni = params.WHEEL_AXIS(i,:)';
+      tau_from_wheels = tau_from_wheels - tau_motor(i) * ni;
+      % log per-wheel torques (desired/actual)
+      state.torque_wheel_desired(k,i) = (-tau_desired_body' * ni); % projection for diagnostics
+      state.torque_wheel_actual(k,i) = tau_motor(i);
+    endfor
+
+    % Integrate body rotational dynamics including gyroscopic term
+    % I ω̇ + ω × (I ω) = τ_total  =>  ω̇ = I^{-1} ( τ_total - ω × (I ω) )
+    % external torques are zero in this sim except wheel reaction torques
+    omega_prev = state.angvel_true(k-1, :)';  % body rates in body frame
+    I = params.I_body;
+    Iomega = I * omega_prev;
+    gyro_term = cross(omega_prev, Iomega);
+    tau_total = tau_from_wheels; % plus any external torques if present
+    omega_dot = params.I_body_inv * (tau_total - gyro_term);
+    omega_new = omega_prev + omega_dot * DT;
+    state.angvel_true(k, :) = omega_new';
+
+    % Integrate attitude quaternion using body rates (body rates -> quaternion derivative)
+    % q_dot = 0.5 * Omega(omega) * q
+    q_prev = state.Qf(k-1,:)';
+    % build Omega(omega) (4x4)
+    wx = omega_new(1); wy = omega_new(2); wz = omega_new(3);
+    Omega = 0.5 * [  0, -wx, -wy, -wz;
+                    wx,   0,  wz, -wy;
+                    wy, -wz,   0,  wx;
+                    wz,  wy, -wx,   0 ];
+    q_dot = Omega * q_prev;
+    q_new = q_prev + q_dot * DT;
+    q_new = q_new / norm(q_new + 1e-12);
+    state.Qf(k,:) = q_new';
+    % Update true Euler angles for logging/plots (convert quaternion -> euler)
+    eul = quat2eul(q_new'); % assumes your eul2quat/quaternion convention matches quat2eul
+    state.angle_true(k,:) = eul;
+    state.roll_f(k) = eul(1); state.pitch_f(k) = eul(2); state.yaw_f(k) = eul(3);
+endfor
 endfunction
 
 % -------------------------------------------------------------------------
@@ -206,8 +263,8 @@ function plot_results(state, params)
   deg = @(x) (180/pi) * x;
 
   setpoint_deg = deg(state.setpoint);
-  angle_true_deg = deg(state.angle_true);
-  angle_filt_deg = deg([state.roll_f, state.pitch_f, state.yaw_f]);
+  angle_true_deg = unwrap(deg(state.angle_true));
+  angle_filt_deg = unwrap(deg([state.roll_f, state.pitch_f, state.yaw_f]));
 
   % Angles: 3 subplots
   figure('Name','Angles: Setpoint vs True vs Filtered','NumberTitle','off');
@@ -254,25 +311,25 @@ function plot_results(state, params)
   legend('cmd raw','true \omega','Location','NorthEast'); title('Yaw angular velocity');
 
   figure('Name','Flywheel Torque','NumberTitle','off');
-  torque_desired_deg = rad2deg(state.torque_wheel_desired);
-  torque_actual_deg = rad2deg(state.torque_wheel_actual);
+  torque_desired_deg = state.torque_wheel_desired;
+  torque_actual_deg = state.torque_wheel_actual;
 
   subplot(3,1,1);
   plot(state.t, torque_desired_deg(:,params.IDX_X), '--', 'LineWidth', 1.2); hold on;
   plot(state.t, torque_actual_deg(:,params.IDX_X), '-', 'LineWidth', 1.2);
-  grid on; ylabel('Roll Torque (deg/s²)'); title('Flywheel Torque: Roll');
+  grid on; ylabel('Roll Torque (N/m)'); title('Flywheel Torque: Roll');
   legend('desired','actual','Location','NorthEast');
 
   subplot(3,1,2);
   plot(state.t, torque_desired_deg(:,params.IDX_Y), '--', 'LineWidth', 1.2); hold on;
   plot(state.t, torque_actual_deg(:,params.IDX_Y), '-', 'LineWidth', 1.2);
-  grid on; ylabel('Pitch Torque (deg/s²)'); title('Flywheel Torque: Pitch');
+  grid on; ylabel('Pitch Torque (N/m)'); title('Flywheel Torque: Pitch');
   legend('desired','actual','Location','NorthEast');
 
   subplot(3,1,3);
   plot(state.t, torque_desired_deg(:,params.IDX_Z), '--', 'LineWidth', 1.2); hold on;
   plot(state.t, torque_actual_deg(:,params.IDX_Z), '-', 'LineWidth', 1.2);
-  grid on; ylabel('Yaw Torque (deg/s²)'); xlabel('Time (s)'); title('Flywheel Torque: Yaw');
+  grid on; ylabel('Yaw Torque (N/m)'); xlabel('Time (s)'); title('Flywheel Torque: Yaw');
   legend('desired','actual','Location','NorthEast');
 
   drawnow();
@@ -291,28 +348,99 @@ function acc_body = true_accel_from_euler(roll, pitch, yaw, G)
 endfunction
 
 function [roll_f, pitch_f, yaw_f, qf] = comp_step(roll_prev, pitch_prev, yaw_prev, gyr, acc, params)
+  % Quaternion-based complementary fusion:
+  % - propagate quaternion using body rates (gyr)
+  % - estimate roll/pitch from accel, build an accel-only quaternion (no yaw)
+  % - slerp / blend between gyro-propagated quaternion and accel quaternion for roll/pitch correction
   DT = params.DT; ALPHA = params.ALPHA; EPS = params.EPS;
-  ix = params.IDX_X; iy = params.IDX_Y; iz = params.IDX_Z;
 
-  roll_gyro  = roll_prev  + gyr(ix) * DT;
-  pitch_gyro = pitch_prev + gyr(iy) * DT;
-  yaw_gyro   = yaw_prev   + gyr(iz) * DT;
+  % Reconstruct previous quaternion from euler inputs
+  q_prev = eul2quat(roll_prev, pitch_prev, yaw_prev)';
+  q_prev = q_prev / (norm(q_prev) + 1e-12);
 
-  ax = acc(ix); ay = acc(iy); az = acc(iz);
-  denom = sqrt(ay*ay + az*az + EPS);
+  % Propagate quaternion using body rates (gyr)
+  wx = gyr(params.IDX_X); wy = gyr(params.IDX_Y); wz = gyr(params.IDX_Z);
+  Omega = 0.5 * [  0, -wx, -wy, -wz;
+                  wx,   0,  wz, -wy;
+                  wy, -wz,   0,  wx;
+                  wz,  wy, -wx,   0 ];
+  q_dot = Omega * q_prev;
+  q_gyro = q_prev + q_dot * DT;
+  q_gyro = q_gyro / (norm(q_gyro) + 1e-12);
+
+  % Accel-derived roll/pitch (body frame)
+  ax = acc(params.IDX_X); ay = acc(params.IDX_Y); az = acc(params.IDX_Z);
   roll_acc  = atan2(ay, az);
-  pitch_acc = atan2(-ax, denom);
+  pitch_acc = atan2(-ax, sqrt(ay*ay + az*az + EPS));
+  % build accel quaternion (no yaw)
+  q_acc = eul2quat(roll_acc, pitch_acc, 0)';
+  q_acc = q_acc / (norm(q_acc) + 1e-12);
 
-  roll_f  = ALPHA * roll_gyro  + (1 - ALPHA) * roll_acc;
-  pitch_f = ALPHA * pitch_gyro + (1 - ALPHA) * pitch_acc;
-  yaw_f   = yaw_gyro;
+  % Complementary blend: prefer gyro for high-frequency, accel for low-frequency
+  alpha = ALPHA;
+  % Simple quaternion blend via normalized linear interpolation (approx slerp)
+  qf = (alpha * q_gyro + (1 - alpha) * q_acc);
+  qf = qf / (norm(qf) + 1e-12);
 
-  roll_f  = wrap_angle(roll_f);
-  pitch_f = wrap_angle(pitch_f);
-  yaw_f   = wrap_angle(yaw_f);
+  % Output filtered Euler angles
+  eul = quat2eul(qf'); % [roll pitch yaw]
+  roll_f = wrap_angle(eul(1));
+  pitch_f = wrap_angle(eul(2));
+  yaw_f = wrap_angle(eul(3));
+  qf = qf';
+endfunction
 
-  qf = eul2quat(roll_f, pitch_f, yaw_f);
-  qf = normalize_quat(qf);
+function plot_3d_floatsat(state)
+    figure('Name','3D FloatSat Visualization','NumberTitle','off');
+    axis equal
+    grid on
+    xlabel('X'); ylabel('Y'); zlabel('Z');
+    view(3)
+    hold on
+
+    % Fix axes limits (cube of size 0.2 m + margin)
+    axis_limit = 0.1;
+    axis([-axis_limit axis_limit -axis_limit axis_limit -axis_limit axis_limit]);
+    axis manual;
+
+    % Cube vertices (centered at origin, size 0.1 m)
+    s = 0.1;
+    [X,Y,Z] = ndgrid([-1,1]*s/2);
+    verts = [X(:), Y(:), Z(:)];
+
+    % Cube faces (for patch)
+    faces = [1 3 7 5; 2 4 8 6; 1 2 6 5; 3 4 8 7; 1 2 4 3; 5 6 8 7];
+
+    hCube = patch('Vertices',verts,'Faces',faces,'FaceColor','cyan','FaceAlpha',0.3);
+
+    % Draw a +Z axis arrow (from origin along body up)
+    hArrow = quiver3(0,0,0,0,0,0.15,'LineWidth',2,'Color','magenta','MaxHeadSize',0.5);
+
+    % Animation loop
+    N = length(state.t);
+    for k = 1:N
+        q = state.Qf(k,:); % quaternion
+        R = quat2rotm(q);   % 3x3 rotation matrix from body to world frame
+
+        % Rotate vertices
+        verts_rot = (R * verts')';
+        set(hCube,'Vertices',verts_rot);
+
+        % Rotate arrow: points along body +Z
+        arrow_dir = R * [0;0;0.15];
+        set(hArrow,'UData',arrow_dir(1),'VData',arrow_dir(2),'WData',arrow_dir(3));
+
+        drawnow
+        pause(0.01); % adjust speed
+    endfor
+endfunction
+
+function R = quat2rotm(q)
+    % Convert quaternion [w x y z] to rotation matrix
+    w = q(1); x = q(2); y = q(3); z = q(4);
+    R = [1-2*(y^2+z^2), 2*(x*y - z*w), 2*(x*z + y*w);
+         2*(x*y + z*w), 1-2*(x^2+z^2), 2*(y*z - x*w);
+         2*(x*z - y*w), 2*(y*z + x*w), 1-2*(x^2+y^2)];
 endfunction
 
 % Run the main entry point automatically when the file is executed
