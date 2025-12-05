@@ -17,7 +17,7 @@ function params = setup_params()
   % Simulation params
   params.SAMPLE_RATE_HZ = 100;
   params.DT = 1.0 / params.SAMPLE_RATE_HZ;
-  params.SIM_DURATION_S = 20.0;
+  params.SIM_DURATION_S = 30.0;
   params.N = round(params.SIM_DURATION_S * params.SAMPLE_RATE_HZ);
 
   % Physical constants
@@ -50,7 +50,7 @@ function params = setup_params()
 
   % Setpoint: change at 1 second
   params.SETPOINT_STEP_TIME = 1.0;
-  params.SETPOINT_DEG = [10, 150, -30]; % [roll, pitch, yaw] in degrees after step
+  params.SETPOINT_DEG = [-10, 10, 40]; % [roll, pitch, yaw] in degrees after step
 
   % Flywheel actuator parameters
   % per-wheel rotational inertia (kg·m^2). Measure or compute from geometry.
@@ -60,14 +60,11 @@ function params = setup_params()
   % motor torque limits
   params.FLYWHEEL.torque_max = [0.2, 0.2, 0.2]; % N·m (example values)
 
-  tilt_deg = 54.736;        % angle from Z-axis
-  tilt_rad = deg2rad(tilt_deg);
-
   azimuth_deg = [0, 120, 240];   % wheel azimuths in XY plane
   azimuth_rad = deg2rad(azimuth_deg);
 
   r_mount = 0.0633;   % distance from body center in XY plane
-  z_offset = -0.0633; % slightly below body center along Z
+  z_offset = -0.03022; % slightly below body center along Z
 
   wheel_pos = zeros(3,3); % 3 wheels x 3 components
   wheel_axis = zeros(3,3);
@@ -86,6 +83,13 @@ function params = setup_params()
 
   params.WHEEL_POS  = wheel_pos;
   params.WHEEL_AXIS = wheel_axis;
+
+  % params.WHEEL_POS = [ 0.063, 0, 0;
+  %                      0, 0.063, 0;
+  %                      0, 0, -0.063 ];
+  % params.WHEEL_AXIS = [ 1, 0, 0;
+  %                       0, 1, 0;
+  %                       0, 0, 1 ];
 
   params.I_body = [ 1, 0, 0;
                     0, 1, 0;
@@ -255,8 +259,8 @@ function plot_results(state, params)
   deg = @(x) (180/pi) * x;
 
   setpoint_deg = deg(state.setpoint);
-  angle_true_deg = unwrap(deg(state.angle_true));
-  angle_filt_deg = unwrap(deg([state.roll_f, state.pitch_f, state.yaw_f]));
+  angle_true_deg = deg(state.angle_true);
+  angle_filt_deg = deg([state.roll_f, state.pitch_f, state.yaw_f]);
 
   % Angles: 3 subplots
   figure('Name','Angles: Setpoint vs True vs Filtered','NumberTitle','off');
@@ -287,20 +291,20 @@ function plot_results(state, params)
   plot(t, cmd_before_deg(:,IDX_X), '--', 'LineWidth', 1.0); hold on;
   plot(t, angvel_true_deg(:,IDX_X), '-', 'LineWidth', 1.0);
   grid on; ylabel('Roll \omega (deg/s)');
-  legend('cmd raw','true \omega','Location','NorthEast'); title('Roll angular velocity');
+  legend('cmd raw','true \omega','Location','NorthEast'); title('Flywheel Angular Velocity: Roll');
 
   subplot(3,1,2);
   plot(t, cmd_before_deg(:,IDX_Y), '--', 'LineWidth', 1.0); hold on;
   plot(t, angvel_true_deg(:,IDX_Y), '-', 'LineWidth', 1.0);
   grid on; ylabel('Pitch \omega (deg/s)');
-  legend('cmd raw','true \omega','Location','NorthEast'); title('Pitch angular velocity');
+  legend('cmd raw','true \omega','Location','NorthEast'); title('Flywheel Angular Velocity: Pitch');
 
   subplot(3,1,3);
   plot(t, cmd_before_deg(:,IDX_Z), '--', 'LineWidth', 1.0); hold on;
   plot(t, angvel_true_deg(:,IDX_Z), '-', 'LineWidth', 1.0);
   grid on; ylabel('Yaw \omega (deg/s)');
   xlabel('Time (s)');
-  legend('cmd raw','true \omega','Location','NorthEast'); title('Yaw angular velocity');
+  legend('cmd raw','true \omega','Location','NorthEast'); title('Flywheel Angular Velocity: Yaw');
 
   figure('Name','Flywheel Torque','NumberTitle','off');
   torque_desired_deg = state.torque_wheel_desired;
@@ -394,16 +398,75 @@ function plot_3d_floatsat(state, params)
     axis([-axis_limit axis_limit -axis_limit axis_limit -axis_limit axis_limit]);
     axis manual;
 
-    % Cube verts (body frame)
-    s = 0.1;
-    [Xc,Yc,Zc] = ndgrid([-1,1]*s/2);
-    verts_cube = [Xc(:), Yc(:), Zc(:)];
-    faces_cube = [1 3 7 5; 2 4 8 6; 1 2 6 5; 3 4 8 7; 1 2 4 3; 5 6 8 7];
+    % --- Sphere (body frame) ---
+    sphere_radius = 0.0633;   % requested radius
+    sphere_res = 32;
 
-    % Draw cube + top face handle(s)
-    hCube = patch('Vertices',verts_cube,'Faces',faces_cube,'FaceColor','cyan','FaceAlpha',0.3);
+    [Xs, Ys, Zs] = sphere(sphere_res);
+    Xs *= sphere_radius;
+    Ys *= sphere_radius;
+    Zs *= sphere_radius;
 
-    % Prepare flywheel meshes in local wheel coords (cylinder pointing along +Z)
+    % Convert grid → vertices Nx3
+    verts_sphere = [Xs(:), Ys(:), Zs(:)];
+
+    % Build triangle faces (each quad -> 2 tris)
+    faces = [];
+    n = sphere_res + 1;
+    for i = 1:(n-1)
+      for j = 1:(n-1)
+        v1 = (i-1)*n + j;
+        v2 = v1 + 1;
+        v3 = v1 + n;
+        v4 = v3 + 1;
+        faces = [faces;
+                 v1, v2, v3;
+                 v2, v4, v3];
+      endfor
+    endfor
+
+    % Create patch for body
+    hBody = patch('Vertices', verts_sphere, 'Faces', faces, ...
+                  'FaceColor', 'cyan', 'FaceAlpha', 0.5, 'EdgeColor', 'none');
+
+    % -------------------------
+    % Arrow mesh creation (shaft + cone)
+    % -------------------------
+    % Arrow points along +Z in local (body) coords, base at origin.
+    arrow_length = sphere_radius * 1.6;   % visual length
+    shaft_frac = 0.75;                    % fraction of length used by shaft
+    shaft_len = arrow_length * shaft_frac;
+    cone_len  = arrow_length * (1 - shaft_frac);
+    shaft_rad = sphere_radius * 0.12;
+    cone_rad  = shaft_rad * 2.0;
+    nseg = 24;
+
+    [arrow_verts, arrow_faces] = make_arrow_mesh(shaft_rad, shaft_len, cone_rad, cone_len, nseg);
+    % arrow_verts is Nv x 3, faces is M x 3 (triangles)
+
+    % Create two patch handles (current = red, setpoint = green)
+    hCurArrow = patch('Vertices', arrow_verts, 'Faces', arrow_faces, ...
+                      'FaceColor', [1,0,0], 'EdgeColor', 'none', 'FaceAlpha', 1.0);
+    hSPArrow  = patch('Vertices', arrow_verts, 'Faces', arrow_faces, ...
+                      'FaceColor', [0,0.7,0], 'EdgeColor', 'none', 'FaceAlpha', 1.0);
+
+    % ---- PERPENDICULAR ARROWS (to show yaw) ----
+    % rotate +Z arrow to point along +X in body frame (so yaw rotates it in the XY plane)
+    R_zto_x = axis_angle_rot([0;1;0], -pi/2);  % rotate -90deg about Y: +Z -> +X
+
+    perp_scale = 1.0;
+    perp_verts = (R_zto_x * (arrow_verts' * perp_scale))'; % scaled & rotated arrow verts
+
+    % Perp arrow patches
+    hCurPerp = patch('Vertices', perp_verts, 'Faces', arrow_faces, ...
+                     'FaceColor', [1,0.1,0.1], 'EdgeColor', 'none', 'FaceAlpha', 1.0); % orange-ish
+    hSPPerp  = patch('Vertices', perp_verts, 'Faces', arrow_faces, ...
+                     'FaceColor', [0.1,1,0.1], 'EdgeColor', 'none', 'FaceAlpha', 1.0); % light green
+
+    % small center marker
+    plot3(0,0,0, 'k.', 'MarkerSize', 10);
+
+    % Prepare flywheel meshes in local wheel coords (same as your code)
     n_wheels = size(params.WHEEL_POS,1);
     wheel_mesh = cell(n_wheels,1);
     wheel_faces = cell(n_wheels,1);
@@ -420,11 +483,9 @@ function plot_3d_floatsat(state, params)
       wheel_mesh{i} = verts_cyl; wheel_faces{i} = faces_cyl;
       ni = params.WHEEL_AXIS(i,:)';
       % precompute alignment rotation from +Z to ni (in body frame)
-      % if ni is near [0;0;1], set Ralign=eye
       if norm(ni - [0;0;1]) < 1e-6
         Ralign = eye(3);
       else
-        % rotation axis = cross(z, ni)
         rot_axis = cross([0;0;1], ni);
         s = norm(rot_axis);
         c = dot([0;0;1], ni);
@@ -440,29 +501,46 @@ function plot_3d_floatsat(state, params)
       wheel_handle(i) = patch('Vertices',verts_cyl,'Faces',faces_cyl,'FaceColor',[0.6,0.6,0.6],'FaceAlpha',1.0);
     endfor
 
+    % axis we visualize (body +Z)
+    body_axis = [0;0;1];
+
+    % -------------------------
+    % Main loop: update body, wheels and arrows
+    % -------------------------
     N = length(state.t);
     for k = 1:N
         q = state.Qf(k,:); % quaternion [w x y z]
         R_body_to_world = quat2rotm(q);   % 3x3 rotation matrix
 
-        % Cube update
-        verts_cube_world = (R_body_to_world * verts_cube')';
-        set(hCube,'Vertices', verts_cube_world);
+        % Body (sphere) update: transform all vertices from body frame to world
+        verts_body = verts_sphere';            % 3 x Nv
+        verts_world = (R_body_to_world * verts_body)'; % Nv x 3
+        set(hBody, 'Vertices', verts_world);
 
-        % Wheels: transform and spin
+        % ---- update current arrow (rotate arrow mesh by body rotation) ----
+        verts_arrow_body = (R_body_to_world * arrow_verts')'; % Nv x 3
+        set(hCurArrow, 'Vertices', verts_arrow_body);
+        verts_perp_body = (R_body_to_world * perp_verts')'; % transform to world
+        set(hCurPerp, 'Vertices', verts_perp_body);
+
+        % ---- update setpoint arrow (compute setpoint rotation, rotate arrow) ----
+        q_sp = eul2quat(state.setpoint(k,1), state.setpoint(k,2), state.setpoint(k,3))';
+        R_sp = quat2rotm(q_sp);
+        verts_arrow_sp = (R_sp * arrow_verts')';
+        set(hSPArrow, 'Vertices', verts_arrow_sp);
+        verts_perp_sp = (R_sp * perp_verts')'; % transform to world
+        set(hSPPerp, 'Vertices', verts_perp_sp);
+
+        % Wheels: transform and spin (unchanged)
         for i = 1:n_wheels
             verts_cyl = wheel_mesh{i}'; % 3 x Nv (in local cyl coords)
-            % rotation about wheel axis by wheel_angle[k,i] (in body frame)
             angle = state.wheel_angle(k,i);
             ni = params.WHEEL_AXIS(i,:)';
             Rspin = axis_angle_rot(ni, angle); % rotate about ni in body frame
-            % align cylinder then spin: produce verts in body frame
-            verts_body = (Rspin * (wheel_Ralign{i} * verts_cyl));
-            % translate to wheel mount pos (body frame)
+            verts_body_cyl = (Rspin * (wheel_Ralign{i} * verts_cyl));
             pos_body = wheel_pos{i};
-            verts_body = verts_body + repmat(pos_body, 1, size(verts_body,2));
-            % transform to world frame
-            verts_world = (R_body_to_world * verts_body)';
+            verts_body_cyl = verts_body_cyl + repmat(pos_body, 1, size(verts_body_cyl,2));
+            verts_world = (R_body_to_world * verts_body_cyl)';
             set(wheel_handle(i), 'Vertices', verts_world);
         endfor
 
@@ -485,54 +563,131 @@ function R = axis_angle_rot(axis, theta)
 endfunction
 
 function [verts, faces] = make_cylinder_mesh(radius, length, nseg)
-  % Cylinder along local Z from -length/2 .. +length/2
   if nargin < 3, nseg = 24; end
-  [X,Y] = cylinder(radius, nseg);
-  Z = repmat(linspace(-length/2, length/2, size(X,1))', 1, size(X,2));
+
+  % Get cylinder grid (cylinder returns nseg+1 columns: last == first)
+  [X, Y] = cylinder(radius, nseg);
+  % remove duplicated seam column so we have exactly nseg samples around
+  X = X(:,1:end-1);
+  Y = Y(:,1:end-1);
+
+  nz = size(X,1);           % number of rings along Z (usually 2)
+  nv_per_ring = nseg;       % now exactly nseg vertices per ring
+
+  % Z values for each ring (nz x nv_per_ring)
+  Z = repmat(linspace(-length/2, length/2, nz)', 1, nv_per_ring);
+
+  % build vertex list (flatten column-major: first column then second)
   verts = [X(:), Y(:), Z(:)];
-  % build faces (side quads + two caps)
-  nv_per_ring = size(X,2);
-  faces = [];
-  % side quads
-  for c = 1:(nv_per_ring-1)
-    for r = 1:(size(X,1)-1)
-      a = (r-1)*nv_per_ring + c;
-      b = a + 1;
-      d = a + nv_per_ring;
-      cidx = b + nv_per_ring;
-      faces = [faces; a b cidx d];
+
+  % correct index function for column-major flattening:
+  % for (r,c): index = (c-1)*nz + r
+  idx = @(r,c) (c-1)*nz + r;
+
+  % preallocate face array
+  n_side_tris = (nz-1) * nv_per_ring * 2;
+  n_cap_tris  = nv_per_ring * 2;
+  total_tris  = n_side_tris + n_cap_tris;
+  faces = zeros(total_tris, 3);
+  p = 1;
+
+  % --- Side faces (two triangles per quad) ---
+  for r = 1:(nz-1)
+    for c = 1:nv_per_ring
+      c2 = mod(c, nv_per_ring) + 1; % next column (wrap)
+      a = idx(r, c);
+      b = idx(r, c2);
+      d = idx(r+1, c);
+      cidx = idx(r+1, c2);
+      % triangle 1
+      faces(p, :) = [a, b, d]; p = p + 1;
+      % triangle 2
+      faces(p, :) = [b, cidx, d]; p = p + 1;
     endfor
   endfor
-  % seam quads (wrap last->first)
-  for r = 1:(size(X,1)-1)
-    a = (r-1)*nv_per_ring + nv_per_ring;
-    b = (r-1)*nv_per_ring + 1;
-    d = a + nv_per_ring;
-    cidx = b + nv_per_ring;
-    faces = [faces; a b cidx d];
-  endfor
-  % caps (triangulate fan)
+
+  % --- Caps (triangulate as fan) ---
   top_center_idx = size(verts,1) + 1;
-  bottom_center_idx = size(verts,1) + 2;
-  verts = [verts; 0 0 length/2; 0 0 -length/2];
-  for c = 1:(nv_per_ring-1)
-    a = (size(X,1)-1)*nv_per_ring + c;
-    b = a + 1;
-    faces = [faces; a b top_center_idx top_center_idx];
+  bottom_center_idx = top_center_idx + 1;
+  verts = [verts; 0,0, length/2; 0,0, -length/2];
+
+  % top cap (ring r = nz), winding so normal -> +Z
+  for c = 1:nv_per_ring
+    c2 = mod(c, nv_per_ring) + 1;
+    a = idx(nz, c);
+    b = idx(nz, c2);
+    faces(p, :) = [a, b, top_center_idx]; p = p + 1;
   endfor
-  % seam for top
-  a = (size(X,1)-1)*nv_per_ring + nv_per_ring;
-  b = (size(X,1)-1)*nv_per_ring + 1;
-  faces = [faces; a b top_center_idx top_center_idx];
-  % bottom cap (reverse order)
-  for c = 1:(nv_per_ring-1)
-    a = c;
-    b = c + 1;
-    faces = [faces; b a bottom_center_idx bottom_center_idx];
+
+  % bottom cap (ring r = 1), reverse order so normal -> -Z
+  for c = 1:nv_per_ring
+    c2 = mod(c, nv_per_ring) + 1;
+    a = idx(1, c);
+    b = idx(1, c2);
+    faces(p, :) = [b, a, bottom_center_idx]; p = p + 1;
   endfor
-  a = nv_per_ring;
-  b = 1;
-  faces = [faces; b a bottom_center_idx bottom_center_idx];
+endfunction
+
+function [verts, faces] = make_arrow_mesh(shaft_rad, shaft_len, cone_rad, cone_len, nseg)
+  if nargin < 5, nseg = 24; end
+  % Rings:
+  % bottom ring at z=0 (base)
+  z0 = 0;
+  z1 = shaft_len;        % ring where cone starts
+  z2 = shaft_len + cone_len; % apex z
+
+  theta = linspace(0, 2*pi, nseg+1);
+  theta(end) = []; % remove duplicate
+  % bottom ring
+  xb = shaft_rad * cos(theta)'; yb = shaft_rad * sin(theta)'; zb = z0 * ones(nseg,1);
+  % top ring (shaft->cone start) use shaft radius
+  xt = shaft_rad * cos(theta)'; yt = shaft_rad * sin(theta)'; zt = z1 * ones(nseg,1);
+  % cone ring (base of cone) uses cone_rad at z1
+  xc = cone_rad  * cos(theta)'; yc = cone_rad  * sin(theta)'; zc = z1 * ones(nseg,1);
+  apex = [0,0,z2];
+
+  % assemble verts (Nv x 3)
+  verts = [xb, yb, zb;
+           xt, yt, zt;
+           xc, yc, zc;
+           apex];
+
+  % indices
+  idx_b = 1:nseg;
+  idx_t = nseg + (1:nseg);
+  idx_c = 2*nseg + (1:nseg);
+  idx_ap = 3*nseg + 1;
+
+  faces = [];
+  % shaft side: each quad -> 2 triangles
+  for c = 1:nseg
+    a = idx_b(c);
+    b = idx_b(mod(c, nseg) + 1);
+    d = idx_t(c);
+    cidx = idx_t(mod(c, nseg) + 1);
+    % two triangles: a-b-d and b-cidx-d
+    faces = [faces;
+             a, b, d;
+             b, cidx, d];
+  endfor
+
+  % seam triangles already handled by modulo indexing
+
+  % cone side: triangles from cone ring to apex
+  for c = 1:nseg
+    a = idx_c(c);
+    b = idx_c(mod(c, nseg) + 1);
+    faces = [faces; a, b, idx_ap];
+  endfor
+
+  % optional: cap bottom (triangulate to origin) so arrow looks solid if seen from below
+  bottom_center_idx = size(verts,1) + 1;
+  verts = [verts; 0, 0, z0];
+  for c = 1:nseg
+    a = idx_b(c);
+    b = idx_b(mod(c, nseg) + 1);
+    faces = [faces; a, b, bottom_center_idx];
+  endfor
 endfunction
 
 function [tau_desired_body, pid_state] = pid_quat(q_current, q_setpoint, pid_state, params, DT)
