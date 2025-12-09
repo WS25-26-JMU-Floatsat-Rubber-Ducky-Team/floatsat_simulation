@@ -32,6 +32,9 @@ function params = setup_params()
   params.TAU = 0.5;
   params.ALPHA = params.TAU / (params.TAU + params.DT);
 
+  params.TAU_YAW = 5.0;               % seconds (tune)
+  params.ALPHA_YAW = params.TAU_YAW / (params.TAU_YAW + params.DT);
+
   % Initial yaw
   params.INITIAL_YAW = 0.0;
 
@@ -104,6 +107,24 @@ function params = setup_params()
   params.comp.IDX_X = params.IDX_X;
   params.comp.IDX_Y = params.IDX_Y;
   params.comp.IDX_Z = params.IDX_Z;
+
+  params.SENSOR.MAG_DIR = [1; 0; 0]; % direction of magnetic north in inertial coords (unit)
+  params.SENSOR.MAG_NOISE_STD = 0.05;      % white noise std per sample (rad/s)
+  params.SENSOR.MAG_BIAS_INIT_STD = 0.01;   % initial bias std (rad/s)
+  params.SENSOR.MAG_BIAS_RW_STD = 1e-4;     % bias random-walk std (rad/s / sqrt(s))
+
+  params.SENSOR.GYRO_NOISE_STD = 0.05;      % white noise std per sample (rad/s)
+  params.SENSOR.GYRO_BIAS_INIT_STD = 0.01;   % initial bias std (rad/s)
+  params.SENSOR.GYRO_BIAS_RW_STD = 1e-4;     % bias random-walk std (rad/s / sqrt(s))
+
+  params.SENSOR.ACC_NOISE_STD = 0.05;        % white noise std per sample (m/s^2)
+  params.SENSOR.ACC_BIAS_INIT_STD = 0.1;     % initial accel bias std (m/s^2)
+  params.SENSOR.ACC_BIAS_RW_STD = 1e-3;      % accel bias random-walk std (m/s / sqrt(s))
+
+  % Optional: quantization (e.g., ADC or sensor LSB). Set to 0 to disable.
+  params.SENSOR.MAG_QUANT = 0.0;   % rad/s
+  params.SENSOR.GYRO_QUANT = 0.0;   % rad/s
+  params.SENSOR.ACC_QUANT  = 0.0;   % m/s^2
 endfunction
 
 function state = setup_state(params)
@@ -129,6 +150,10 @@ function state = setup_state(params)
 
   state.gyr_meas = zeros(N,3);
   state.acc_meas = zeros(N,3);
+  state.mag_meas = zeros(N,3);
+
+  % Measured Euler angles (noisy) stored in state for easy plotting
+  state.angle_meas = zeros(N,3);   % [roll, pitch, yaw] measured (rad)
 
   state.cmd_angvel = zeros(N,3);
   state.cmd_after_act = zeros(N,3);
@@ -154,9 +179,23 @@ function state = setup_state(params)
   state.angle_true(1,:) = [0, 0, params.INITIAL_YAW];
   state.angvel_true(1,:) = [0,0,0];
 
-  % Initial sensors from true state
-  state.gyr_meas(1,:) = state.angvel_true(1,:);
-  state.acc_meas(1,:) = true_accel_from_euler(state.angle_true(1,1), state.angle_true(1,2), state.angle_true(1,3), params.G);
+  if isfield(params, 'RNG_SEED') && ~isempty(params.RNG_SEED)
+    rand("seed", params.RNG_SEED);
+  end
+
+  % True sensor logs (for analysis)
+  state.gyr_true = zeros(N,3);   % true angular rate
+  state.acc_true = zeros(N,3);   % true accel
+
+  % Bias state (kept in state so we can log it)
+  state.mag_bias  = zeros(N,3);  % per-step bias history: starts from random initial bias
+  state.gyro_bias = zeros(N,3);
+  state.acc_bias  = zeros(N,3);
+
+  % Initialize first-step biases (draw from initial bias std)
+  state.mag_bias(1,:) = params.SENSOR.MAG_BIAS_INIT_STD * randn(1,3);
+  state.gyro_bias(1,:) = params.SENSOR.GYRO_BIAS_INIT_STD * randn(1,3);
+  state.acc_bias(1,:)  = params.SENSOR.ACC_BIAS_INIT_STD  * randn(1,3);
 
   % Initial filter estimate from accel
   state.roll_f(1)  = atan2(state.acc_meas(1,2), state.acc_meas(1,3));
@@ -165,7 +204,13 @@ function state = setup_state(params)
   state.Qf(1,:) = eul2quat(state.roll_f(1), state.pitch_f(1), state.yaw_f(1));
   state.Qf(1,:) = normalize_quat(state.Qf(1,:));
 
-  state.Q_true = state.Qf(1,:);  % true attitude quaternion
+  % true attitude quaternion history (store per-step)
+  state.Q_true = zeros(N,4);
+  state.Q_true(1,:) = state.Qf(1,:);
+
+  % Initial sensors from true state
+  state.gyr_meas(1,:) = state.angvel_true(1,:);
+  state.acc_meas(1,:) = true_accel_from_quat(state.Q_true, params.G);
 
   % Scale integrator limits based on actuator
   state.PID_integrator_min = params.PID.integrator_min_frac * 1;
@@ -180,10 +225,84 @@ function [state, params] = run_simulation(state, params)
   DT = params.DT;
 
   for k = 2:N
-    % --- Step 1: Complementary filter (quaternion-only) ---
-    q_prev = state.Qf(k-1,:)';
-    qf = comp_step_quat(q_prev, state.gyr_meas(k,:), state.acc_meas(k,:), params.comp);
+    % Form noisy sensor measurements for time k based on previous true state q_prev and angvel at k-1
+    q_prev_f = state.Qf(k-1,:)';      % previous filtered quaternion (4x1)
+    q_prev_t = state.Q_true(k-1,:)';  % previous true quaternion (4x1)
+    % true sensors from previous true/est state:
+    acc_true_prev = true_accel_from_quat(q_prev_t', params.G); % 1x3
+    gyr_true_prev = state.angvel_true(k-1,:);                 % 1x3
+
+    % evolve biases (random walk) from k-1 -> k
+    gyro_bias_rw_per_step = params.SENSOR.GYRO_BIAS_RW_STD * sqrt(DT);
+    acc_bias_rw_per_step  = params.SENSOR.ACC_BIAS_RW_STD  * sqrt(DT);
+    state.gyro_bias(k,:) = state.gyro_bias(k-1,:) + gyro_bias_rw_per_step * randn(1,3);
+    state.acc_bias(k,:)  = state.acc_bias(k-1,:)  + acc_bias_rw_per_step  * randn(1,3);
+
+    % white noise
+    gyr_noise = params.SENSOR.GYRO_NOISE_STD * randn(1,3);
+    acc_noise = params.SENSOR.ACC_NOISE_STD  * randn(1,3);
+    mag_noise = params.SENSOR.MAG_NOISE_STD * randn(1,3);
+
+    % true mag in body frame
+    R_ib = quat2rotm(q_prev_t');    % body->inertial; transpose = inertial->body
+    m_body_true = R_ib' * params.SENSOR.MAG_DIR; % 3x1
+    mag_bias_rw_per_step = params.SENSOR.MAG_BIAS_RW_STD * sqrt(DT); % add bias + noise
+    state.mag_bias(k,:) = state.mag_bias(k-1,:) + mag_bias_rw_per_step * randn(1,3);
+
+    mag_noise = params.SENSOR.MAG_NOISE_STD * randn(3,1);
+
+    % measured signals (bias + noise)
+    gyr_meas = gyr_true_prev + state.gyro_bias(k,:) + gyr_noise;
+    acc_meas = acc_true_prev + state.acc_bias(k,:) + acc_noise;
+    mag_meas = m_body_true + state.mag_bias(k,:)' + mag_noise;
+
+    % optional quantization
+    if params.SENSOR.MAG_QUANT > 0
+      mag_meas = round(mag_meas / params.SENSOR.MAG_QUANT) * params.SENSOR.MAG_QUANT;
+    end
+    if params.SENSOR.GYRO_QUANT > 0
+      gyr_meas = round(gyr_meas / params.SENSOR.GYRO_QUANT) * params.SENSOR.GYRO_QUANT;
+    end
+    if params.SENSOR.ACC_QUANT > 0
+      acc_meas = round(acc_meas / params.SENSOR.ACC_QUANT) * params.SENSOR.ACC_QUANT;
+    end
+
+    % store noisy measurements for this timestep (so the filter sees them)
+    state.gyr_meas(k,:) = gyr_meas;
+    state.acc_meas(k,:) = acc_meas;
+    state.mag_meas(k,:) = mag_meas';
+
+    % compute measured roll/pitch from accel_meas (same as filter accel branch)
+    ax = acc_meas(params.IDX_X);
+    ay = acc_meas(params.IDX_Y);
+    az = acc_meas(params.IDX_Z);
+    roll_meas  = atan2(ay, az);
+    pitch_meas = atan2(-ax, sqrt(ay*ay + az*az + params.EPS));
+
+    % tilt-compensated magnetometer using the *noisy* mag_meas (column vector)
+    mx = mag_meas(1); my = mag_meas(2); mz = mag_meas(3);
+    sin_r = sin(roll_meas); cos_r = cos(roll_meas);
+    sin_p = sin(pitch_meas); cos_p = cos(pitch_meas);
+
+    mx2 = mx * cos_p + my * sin_r * sin_p + mz * cos_r * sin_p;
+    my2 = my * cos_r - mz * sin_r;
+
+    % IMPORTANT: use same sign convention as quat_from_accmag (atan2(-my2, mx2))
+    yaw_meas = atan2(-my2, mx2);
+
+    % store measured Euler angles (rad)
+    state.angle_meas(k, :) = [roll_meas, pitch_meas, yaw_meas];
+
+    % (optional) store true sensors too for logging
+    state.gyr_true(k,:) = gyr_true_prev;
+    state.acc_true(k,:) = acc_true_prev;
+    qf = comp_step_quat(q_prev_f, state.gyr_meas(k,:), state.acc_meas(k,:), params.comp, mag_meas);
     state.Qf(k,:) = qf';
+
+    eul_filt = quat2eul(qf');  % [roll pitch yaw]
+    state.roll_f(k)  = eul_filt(1);
+    state.pitch_f(k) = eul_filt(2);
+    state.yaw_f(k)   = eul_filt(3);
 
     % --- Step 2: Compute quaternion setpoint from setpoint Euler angles ---
     q_setpoint = eul2quat(state.setpoint(k,1), state.setpoint(k,2), state.setpoint(k,3))';
@@ -239,16 +358,31 @@ function [state, params] = run_simulation(state, params)
                      wx,  0,  wz, -wy;
                      wy, -wz,  0,  wx;
                      wz,  wy, -wx,  0 ];
-    q_dot = Omega * q_prev;
-    q_new = q_prev + q_dot*DT;
-    q_new = q_new / norm(q_new + 1e-12);
-    state.Qf(k,:) = q_new';
+    q_dot_t = Omega * q_prev_t;
+    q_new_t = q_prev_t + q_dot_t*DT;
+    q_new_t = q_new_t / norm(q_new_t + 1e-12);
 
-    % --- Step 9: Update Euler angles for plotting only ---
-    eul = quat2eul(q_new'); % convert for plots
+    % store true quaternion separately (do NOT overwrite filtered quaternion)
+    state.Q_true(k,:) = q_new_t';
+
+    % Update Euler angles for plotting only
+    eul = quat2eul(q_new_t'); % convert for plots
     state.angle_true(k,:) = eul;
-    state.roll_f(k) = eul(1); state.pitch_f(k) = eul(2); state.yaw_f(k) = eul(3);
   endfor
+  % Print mean absolute angle error (deg)
+  true_angles  = state.angle_true;                     % Nx3 (rad)
+  filt_angles  = [state.roll_f, state.pitch_f, state.yaw_f];  % Nx3 (rad)
+
+  angle_err_rad = abs(filt_angles - true_angles);
+  angle_err_deg = (180/pi) * angle_err_rad;
+
+  mean_err_deg = mean(angle_err_deg, 1);   % 1x3
+
+  fprintf('\nMean absolute angle error:\n');
+  fprintf('  Roll  error: %.4f deg\n', mean_err_deg(1));
+  fprintf('  Pitch error: %.4f deg\n', mean_err_deg(2));
+  fprintf('  Yaw   error: %.4f deg\n', mean_err_deg(3));
+  fprintf('\n');
 endfunction
 
 % -------------------------------------------------------------------------
@@ -261,28 +395,38 @@ function plot_results(state, params)
 
   setpoint_deg = deg(state.setpoint);
   angle_true_deg = deg(state.angle_true);
+  angle_meas_deg = deg(state.angle_meas);
   angle_filt_deg = deg([state.roll_f, state.pitch_f, state.yaw_f]);
 
-  % Angles: 3 subplots
-  figure('Name','Angles: Setpoint vs True vs Filtered','NumberTitle','off');
+  % Angles: 3 subplots (Setpoint / True / Measured / Filtered)
+  figure('Name','Angles: Setpoint vs True vs Measured vs Filtered','NumberTitle','off');
+
   subplot(3,1,1);
   plot(t, setpoint_deg(:,IDX_X), '--', 'LineWidth', 1.2); hold on;
   plot(t, angle_true_deg(:,IDX_X), '-', 'LineWidth', 1.0);
+  plot(t, angle_meas_deg(:,IDX_X), '-.', 'LineWidth', 1.0);
   plot(t, angle_filt_deg(:,IDX_X), ':', 'LineWidth', 1.2);
-  grid on; ylabel('Roll (deg)'); legend('setpoint','true','filtered','Location','NorthEast'); title('Roll');
+  grid on; ylabel('Roll (deg)');
+  legend('setpoint','true','measured','filtered','Location','NorthEast');
+  title('Roll');
 
   subplot(3,1,2);
   plot(t, setpoint_deg(:,IDX_Y), '--', 'LineWidth', 1.2); hold on;
   plot(t, angle_true_deg(:,IDX_Y), '-', 'LineWidth', 1.0);
+  plot(t, angle_meas_deg(:,IDX_Y), '-.', 'LineWidth', 1.0);
   plot(t, angle_filt_deg(:,IDX_Y), ':', 'LineWidth', 1.2);
-  grid on; ylabel('Pitch (deg)'); legend('setpoint','true','filtered','Location','NorthEast'); title('Pitch');
+  grid on; ylabel('Pitch (deg)');
+  legend('setpoint','true','measured','filtered','Location','NorthEast');
+  title('Pitch');
 
   subplot(3,1,3);
   plot(t, setpoint_deg(:,IDX_Z), '--', 'LineWidth', 1.2); hold on;
   plot(t, angle_true_deg(:,IDX_Z), '-', 'LineWidth', 1.0);
+  plot(t, angle_meas_deg(:,IDX_Z), '-.', 'LineWidth', 1.0);
   plot(t, angle_filt_deg(:,IDX_Z), ':', 'LineWidth', 1.2);
-  grid on; ylabel('Yaw (deg)'); xlabel('Time (s)'); legend('setpoint','true','filtered','Location','NorthEast'); title('Yaw');
-
+  grid on; ylabel('Yaw (deg)'); xlabel('Time (s)');
+  legend('setpoint','true','measured','filtered','Location','NorthEast');
+  title('Yaw');
   % Angular velocity commands
   figure('Name','Angular velocity commands','NumberTitle','off');
   cmd_before_deg = deg(state.cmd_angvel);
@@ -336,16 +480,32 @@ endfunction
 % Reusable utility functions
 % -------------------------------------------------------------------------
 
-function acc_body = true_accel_from_euler(roll, pitch, yaw, G)
-  % Compute accelerometer reading in body frame due to gravity only.
-  ax = -G * sin(pitch);
-  ay =  G * sin(roll) * cos(pitch);
-  az =  G * cos(roll) * cos(pitch);
-  acc_body = [ax, ay, az];
+function acc_body = true_accel_from_quat(q, G)
+  % Compute accelerometer reading in body frame due to gravity only,
+  % given quaternion q = [w x y z] (body -> inertial).
+  %
+  % acc_body is 1x3 row vector [ax ay az].
+  %
+  % G is gravity magnitude (positive scalar, e.g. 9.81). If your inertial
+  % gravity vector points negative Z, call with G = -9.81 or adjust below.
+  if size(q,2) ~= 4 && size(q,1) == 4
+    q = q'; % make row
+  end
+
+  % Gravity in inertial frame (pointing +Z). If your convention uses -Z,
+  % change this to [0;0;-G].
+  g_inertial = [0; 0; G];
+
+  % Rotation matrix body->inertial
+  R_ib = quat2rotm(q);
+  % Rotation from inertial -> body is R_ib'
+  acc_body_vec = R_ib' * g_inertial;
+
+  acc_body = acc_body_vec(:)'; % return as 1x3 row vector
 endfunction
 
-function qf = comp_step_quat(q_prev, gyr, acc, params)
-  % Complementary filter fully in quaternion
+function qf = comp_step_quat(q_prev, gyr, acc, params, mag)
+  % Complementary filter fully in quaternion using accel + mag
   DT = params.DT; ALPHA = params.ALPHA; EPS = params.EPS;
 
   % --- Propagate quaternion using gyro ---
@@ -358,16 +518,36 @@ function qf = comp_step_quat(q_prev, gyr, acc, params)
   q_gyro = q_prev + q_dot * DT;
   q_gyro = q_gyro / (norm(q_gyro) + 1e-12);
 
-  % --- Accel quaternion (roll/pitch only) ---
-  ax = acc(params.IDX_X); ay = acc(params.IDX_Y); az = acc(params.IDX_Z);
-  roll_acc  = atan2(ay, az);
-  pitch_acc = atan2(-ax, sqrt(ay*ay + az*az + EPS));
-  q_acc = eul2quat(roll_acc, pitch_acc, 0)';
-  q_acc = q_acc / (norm(q_acc) + 1e-12);
+  % --- Accel + magnetometer quaternion (full attitude) ---
+  q_accmag = quat_from_accmag(acc, mag, EPS);
 
-  % --- Complementary filter: SLERP between gyro and accel ---
-  qf = slerp(q_gyro, q_acc, 1 - ALPHA);
-  qf = qf / (norm(qf) + 1e-12);  % normalize
+  % --- Complementary filter: SLERP between gyro and accel+mag ---
+  qf = slerp(q_gyro, q_accmag, 1 - ALPHA);
+  qf = qf / (norm(qf) + 1e-12);
+endfunction
+
+function q_accmag = quat_from_accmag(acc, mag, EPS)
+  % Compute quaternion from accelerometer + magnetometer
+  % Returns 4x1 column vector
+  ax = acc(1); ay = acc(2); az = acc(3);
+  mx = mag(1); my = mag(2); mz = mag(3);
+
+  % Roll/pitch from accel
+  roll  = atan2(ay, az);
+  pitch = atan2(-ax, sqrt(ay^2 + az^2 + EPS));
+
+  % Tilt-compensated magnetometer
+  sin_r = sin(roll); cos_r = cos(roll);
+  sin_p = sin(pitch); cos_p = cos(pitch);
+
+  mx2 = mx * cos_p + my * sin_r * sin_p + mz * cos_r * sin_p;
+  my2 = my * cos_r - mz * sin_r;
+
+  yaw = atan2(-my2, mx2);
+
+  % Euler -> quaternion
+  q_accmag = eul2quat(roll, pitch, yaw)';
+  q_accmag = q_accmag / (norm(q_accmag) + 1e-12);
 endfunction
 
 function q_interp = slerp(q1, q2, t)
