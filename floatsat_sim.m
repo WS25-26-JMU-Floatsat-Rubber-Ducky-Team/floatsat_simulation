@@ -400,7 +400,7 @@ function [state, params] = run_simulation(state, params)
   true_angles  = state.angle_true;                     % Nx3 (rad)
   filt_angles  = [state.roll_f, state.pitch_f, state.yaw_f];  % Nx3 (rad)
 
-  angle_err_rad = abs(filt_angles - true_angles);
+  angle_err_rad = abs(state.setpoint - true_angles);
   angle_err_deg = (180/pi) * angle_err_rad;
 
   mean_err_deg = mean(angle_err_deg, 1);   % 1x3
