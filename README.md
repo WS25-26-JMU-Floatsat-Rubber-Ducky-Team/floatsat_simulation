@@ -1,4 +1,6 @@
-# Flywheel Placement
+# Contents of the repository
+
+## [Flywheel Placement Simulation](.octave/tilt_sweep.m)
 
 The three reaction wheels are arranged symmetrically around the satellite body:
 
@@ -16,3 +18,12 @@ This ensures that the floatsat can rotate equally efficiently around roll, pitch
 
 ![](./img/condition_number_vs_tilt.png)
 ![](./img/singular_values_vs_tilt.png)
+
+## [Octave Control Simulation](octave/floatsat_sim.m)
+
+A simulation made in Octave to get a better grasp on the dynamics of the system and to brainstorm the control structure.
+
+Example run:
+
+![](./img/octave_sim_angle_plot.png)
+![](./img/octave_floatsat_sim.gif)
