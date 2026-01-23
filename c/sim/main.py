@@ -59,6 +59,9 @@ class ControlParams(Structure):
 
         # Timing
         ("dt", c_float),
+
+        # Virtual actuator mapping
+        ("torque_to_rpm", c_float),
     ]
 
 
@@ -284,12 +287,15 @@ def main():
 
     # Actuator limits
     params.max_motor_rpm = 900.0
-    params.max_motor_torque = 10.0
+    params.max_motor_torque = 0.02
 
     # Wheel axis matrix
     params.wheel_axis[0][:] = (0.8165, -0.4083, 0.4083)
     params.wheel_axis[1][:] = (0.0,     0.7071, -0.07071)
     params.wheel_axis[2][:] = (0.5773,  0.5773,  0.5773)
+
+    # Virtual actuator mapping
+    params.torque_to_rpm = params.max_motor_rpm / params.max_motor_torque
 
     # -------------------------
     # Control state
@@ -326,7 +332,7 @@ def main():
     omega = [0.0, 0.0, 0.0]   # body angular velocity [rad/s]
 
     # Diagonal inertia
-    I = [0.02, 0.02, 0.02]
+    I = [1.0, 1.0, 1.0]
     I_inv = [1.0 / I[0], 1.0 / I[1], 1.0 / I[2]]
 
     (fig, ax,

@@ -28,11 +28,6 @@ static quat_t quat_mul(quat_t a, quat_t b)
     return r;
 }
 
-static float radps_to_rpm(float w)
-{
-    return w * (60.0f / (2.0f * (float)M_PI));
-}
-
 /* =========================
  * Initialization
  * ========================= */
@@ -204,7 +199,7 @@ vec3_t control_step(
     );
 
     for (int i = 0; i < 3; i++) {
-        float rpm = radps_to_rpm(motor_tau[i]);
+        float rpm = motor_tau[i] * params->torque_to_rpm;
         motor_rpm.v[i] = clamp(
             rpm,
             -params->max_motor_rpm,

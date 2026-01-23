@@ -52,6 +52,9 @@ typedef struct {
 
     /* Timing */
     float dt;
+
+    /* Virtual actuator mapping */
+    float torque_to_rpm;     // [RPM / Nm]
 } control_params_t;
 
 /* =========================

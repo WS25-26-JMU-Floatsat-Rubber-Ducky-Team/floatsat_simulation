@@ -70,6 +70,8 @@ int main(void)
     params.wheel_axis[2][1] = 0.5773f;
     params.wheel_axis[2][2] = 0.5773f;
 
+    params.torque_to_rpm = params.max_motor_rpm / params.max_motor_torque;
+
     /* =========================
      * Control state
      * ========================= */
