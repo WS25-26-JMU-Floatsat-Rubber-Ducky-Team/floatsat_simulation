@@ -176,7 +176,7 @@ def setup_plot():
     sp_plot_roll,  = ax[0].plot(time_line, roll_sp_line,  'b--', label='Roll SP')
 
     ax[0].set_ylabel('Angle [deg]')
-    ax[0].set_ylim(-180, 180)
+    ax[0].set_ylim(-100, 100)
     ax[0].legend()
     ax[0].grid(True)
 
