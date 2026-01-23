@@ -287,7 +287,7 @@ def main():
 
     # Actuator limits
     params.max_motor_rpm = 900.0
-    params.max_motor_torque = 0.02
+    params.max_motor_torque = 1.0
 
     # Wheel axis matrix
     params.wheel_axis[0][:] = (0.8165, -0.4083, 0.4083)

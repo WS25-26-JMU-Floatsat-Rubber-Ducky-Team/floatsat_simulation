@@ -143,25 +143,44 @@ static void rate_controller(
 
 static void allocate_torque(
     const control_params_t *p,
-    const vec3_t *tau_body,
+    vec3_t *tau_body,
     float motor_tau[3]
 )
 {
-    for (int i = 0; i < 3; i++) {
-        float dot =
-            p->wheel_axis[i][0] * tau_body->v[0] +
-            p->wheel_axis[i][1] * tau_body->v[1] +
-            p->wheel_axis[i][2] * tau_body->v[2];
+    float motor_tau_pred[3];
+    float scale = 1.0f;
 
-        motor_tau[i] = -dot;
+    /* --- Predict wheel torques (no clamping) --- */
+    for (int i = 0; i < 3; i++) {
+        motor_tau_pred[i] =
+            -(p->wheel_axis[i][0] * tau_body->v[0] +
+              p->wheel_axis[i][1] * tau_body->v[1] +
+              p->wheel_axis[i][2] * tau_body->v[2]);
+
+        float ratio = fabsf(motor_tau_pred[i]) / p->max_motor_torque;
+        if (ratio > scale) {
+            scale = ratio;
+        }
+    }
+
+    /* --- Scale body torque if needed --- */
+    if (scale > 1.0f) {
+        float inv = 1.0f / scale;
+        for (int i = 0; i < 3; i++) {
+            tau_body->v[i] *= inv;
+            motor_tau_pred[i] *= inv;
+        }
+    }
+
+    /* --- Final motor torques (with hard safety clamp) --- */
+    for (int i = 0; i < 3; i++) {
         motor_tau[i] = clamp(
-            motor_tau[i],
+            motor_tau_pred[i],
             -p->max_motor_torque,
              p->max_motor_torque
         );
     }
 }
-
 
 vec3_t control_step(
     control_state_t        *state,
