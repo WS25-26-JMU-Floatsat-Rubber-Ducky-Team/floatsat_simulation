@@ -77,7 +77,8 @@ vec3_t control_step(
     const control_params_t *params,
     const quat_t          *q_current,
     const quat_t          *q_setpoint,
-    const vec3_t          *omega_meas  // Angvel measurement across axes for inner loop propagation
+    const vec3_t          *omega_meas, // Angvel measurement across axes for inner loop propagation
+    float                 omega_body_z_cmd // Z spin relative to body frame
 );
 
 #endif /* CONTROL_H */

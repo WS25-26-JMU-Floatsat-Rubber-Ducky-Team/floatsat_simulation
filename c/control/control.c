@@ -187,7 +187,8 @@ vec3_t control_step(
     const control_params_t *params,
     const quat_t           *q_current,
     const quat_t           *q_setpoint,
-    const vec3_t           *omega_meas
+    const vec3_t           *omega_meas,
+    float                   omega_body_z_cmd
 )
 {
     vec3_t omega_cmd;
@@ -202,6 +203,9 @@ vec3_t control_step(
         q_setpoint,
         &omega_cmd
     );
+
+    /* Body-frame Z spin */
+    omega_cmd.v[2] += omega_body_z_cmd;
 
     rate_controller(
         &state->rate_pid,
