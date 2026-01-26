@@ -4,6 +4,7 @@ from ctypes import c_float, POINTER, Structure
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
 import numpy as np
+from mpl_toolkits.mplot3d import Axes3D
 
 # =========================
 # Load shared library
@@ -28,7 +29,6 @@ class Vec3(Structure):
     _fields_ = [
         ("v", c_float * 3),
     ]
-
 
 class PIDState(Structure):
     _fields_ = [
@@ -88,6 +88,7 @@ lib.control_step.argtypes = [
     POINTER(Quat),
     POINTER(Quat),
     POINTER(Vec3),
+    c_float,
 ]
 lib.control_step.restype = Vec3
 
@@ -201,15 +202,132 @@ def setup_plot():
 
 def setup_sliders(fig, initial_yaw=0.0, initial_pitch=0.0, initial_roll=0.0):
     axcolor = 'lightgoldenrodyellow'
-    ax_yaw   = plt.axes([0.25, 0.05, 0.65, 0.03], facecolor=axcolor)
     ax_pitch = plt.axes([0.25, 0.10, 0.65, 0.03], facecolor=axcolor)
     ax_roll  = plt.axes([0.25, 0.15, 0.65, 0.03], facecolor=axcolor)
+    ax_yaw   = plt.axes([0.25, 0.05, 0.65, 0.03], facecolor=axcolor)
+    ax_omega = plt.axes([0.25, 0.20, 0.65, 0.03], facecolor=axcolor)  # new slider
 
-    yaw_slider   = Slider(ax_yaw, 'Yaw', -90.0, 90.0, valinit=initial_yaw)
     pitch_slider = Slider(ax_pitch, 'Pitch', -90.0, 90.0, valinit=initial_pitch)
     roll_slider  = Slider(ax_roll, 'Roll', -90.0, 90.0, valinit=initial_roll)
+    yaw_slider   = Slider(ax_yaw, 'Yaw', -90.0, 90.0, valinit=initial_yaw)
+    omega_z_slider = Slider(ax_omega, 'Body Z rot', -90.0, 90.0, valinit=0.0)  # deg/s
 
-    return yaw_slider, pitch_slider, roll_slider
+    return yaw_slider, pitch_slider, roll_slider, omega_z_slider
+
+def setup_3d_visualization(cube_size=0.2):
+    fig_3d = plt.figure(figsize=(6,6))
+    ax3d = fig_3d.add_subplot(111, projection='3d')
+    ax3d.set_xlim([-1,1])
+    ax3d.set_ylim([-1,1])
+    ax3d.set_zlim([-1,1])
+    ax3d.set_xlabel('X')
+    ax3d.set_ylabel('Y')
+    ax3d.set_zlabel('Z')
+    ax3d.set_box_aspect([1,1,1])
+
+    cube_vertices = np.array([
+        [-1,-1,-1],[ 1,-1,-1],[ 1, 1,-1],[-1, 1,-1],
+        [-1,-1, 1],[ 1,-1, 1],[ 1, 1, 1],[-1, 1, 1],
+    ], dtype=float) * cube_size
+
+    cube_edges = [
+        (0,1),(1,2),(2,3),(3,0),
+        (4,5),(5,6),(6,7),(7,4),
+        (0,4),(1,5),(2,6),(3,7)
+    ]
+
+    cube_lines = []
+    for e in cube_edges:
+        line, = ax3d.plot(
+            cube_vertices[[e[0], e[1]],0],
+            cube_vertices[[e[0], e[1]],1],
+            cube_vertices[[e[0], e[1]],2],
+            'b'
+        )
+        cube_lines.append(line)
+
+    # --- Body axes arrows (start along unit axes) ---
+    axis_length = cube_size * 2.0
+    body_axes = np.eye(3) * axis_length  # X,Y,Z basis vectors
+
+    quivers = [
+        ax3d.quiver(0,0,0, body_axes[0,0], body_axes[0,1], body_axes[0,2], color='r'),
+        ax3d.quiver(0,0,0, body_axes[1,0], body_axes[1,1], body_axes[1,2], color='g'),
+        ax3d.quiver(0,0,0, body_axes[2,0], body_axes[2,1], body_axes[2,2], color='b'),
+    ]
+
+    return fig_3d, ax3d, cube_lines, cube_vertices, cube_edges, quivers
+
+def rotate_vectors(vectors, q: Quat):
+    qv = np.array([q.w, q.x, q.y, q.z])
+
+    def quat_mul(a, b):
+        return np.array([
+            a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3],
+            a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2],
+            a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1],
+            a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0]
+        ])
+
+    qc = np.array([qv[0], -qv[1], -qv[2], -qv[3]])
+
+    rotated = []
+    for v in vectors:
+        vq = np.array([0.0, *v])
+        vr = quat_mul(quat_mul(qv, vq), qc)
+        rotated.append(vr[1:])
+    return np.array(rotated)
+
+def rotate_cube(vertices, q: Quat):
+    """
+    Rotate vertices by quaternion q
+    """
+    def quat_mul(a, b):
+        w = a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3]
+        x = a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2]
+        y = a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1]
+        z = a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0]
+        return np.array([w,x,y,z])
+    def quat_conj(qv):
+        return np.array([qv[0], -qv[1], -qv[2], -qv[3]])
+
+    qv = np.array([q.w, q.x, q.y, q.z])
+    qc = quat_conj(qv)
+
+    rotated = []
+    for v in vertices:
+        vq = np.array([0.0, *v])
+        vr = quat_mul(quat_mul(qv, vq), qc)
+        rotated.append(vr[1:])
+    return np.array(rotated)
+
+
+def update_3d_visualization(cube_lines, cube_vertices, cube_edges, quivers, q_current):
+    rotated_vertices = rotate_cube(cube_vertices, q_current)
+
+    # Update cube edges
+    for i, e in enumerate(cube_edges):
+        cube_lines[i].set_data(rotated_vertices[[e[0], e[1]],0],
+                               rotated_vertices[[e[0], e[1]],1])
+        cube_lines[i].set_3d_properties(rotated_vertices[[e[0], e[1]],2])
+
+    # --- Rotate body axes ---
+    axis_length = np.linalg.norm(cube_vertices[0]) * 2
+    body_axes = np.eye(3) * axis_length
+    rotated_axes = rotate_vectors(body_axes, q_current)
+
+    # Remove old arrows
+    for q in quivers:
+        q.remove()
+
+    ax = cube_lines[0].axes
+
+    # Draw new arrows
+    quivers[0] = ax.quiver(0,0,0, *rotated_axes[0], color='r')
+    quivers[1] = ax.quiver(0,0,0, *rotated_axes[1], color='g')
+    quivers[2] = ax.quiver(0,0,0, *rotated_axes[2], color='b')
+
+    plt.draw()
 
 def update_plot(att_plots, sp_plots, rpm_plot_lines,
                 time_line, yaw_line, pitch_line, roll_line,
@@ -342,7 +460,8 @@ def main():
      time_line, yaw_line, pitch_line, roll_line,
      yaw_sp_line, pitch_sp_line, roll_sp_line,
      omega_line) = setup_plot()
-    yaw_slider, pitch_slider, roll_slider = setup_sliders(fig, initial_yaw=0.0, initial_pitch=0.0, initial_roll=0.0)
+    yaw_slider, pitch_slider, roll_slider, omega_z_slider = setup_sliders(fig, initial_yaw=0.0, initial_pitch=0.0, initial_roll=0.0)
+    fig3d, ax3d, cube_lines, cube_vertices, cube_edges, quivers = setup_3d_visualization()
 
     # Continuous loop with matplotlib interactive mode
     plt.ion()
@@ -358,10 +477,12 @@ def main():
         roll_deg  = roll_slider.val
         pitch_deg = pitch_slider.val
         yaw_deg   = yaw_slider.val
+        omega_z_speed = omega_z_slider.val
 
         roll_rad  = deg2rad(roll_deg)
         pitch_rad = deg2rad(pitch_deg)
         yaw_rad   = deg2rad(yaw_deg)
+        omega_z_speed_rad = deg2rad(omega_z_speed)
 
         q_setpoint = euler_to_quat(roll_rad, pitch_rad, yaw_rad)
 
@@ -374,6 +495,7 @@ def main():
             ctypes.byref(q_current),
             ctypes.byref(q_setpoint),
             ctypes.byref(omega_meas),
+            c_float(omega_z_speed_rad),
         )
 
         # print(motor_rpm.v[0],motor_rpm.v[1], motor_rpm.v[2])
@@ -420,6 +542,7 @@ def main():
                     yaw_sp_line, pitch_sp_line, roll_sp_line,
                     omega_line,
                     t, angles_deg, sp_angles_deg, motor_rpm)
+        update_3d_visualization(cube_lines, cube_vertices, cube_edges, quivers, q_current)
 
         plt.pause(dt)
         t += dt
