@@ -393,13 +393,13 @@ def main():
     # Outer (angle) PID
     params.angle_kp[:] = (1.0, 1.0, 1.0)
     params.angle_ki[:] = (0.0, 0.0, 0.0)
-    params.angle_kd[:] = (0.0, 0.0, 0.0)
+    params.angle_kd[:] = (1.0, 1.0, 1.0)
 
     max_ang = deg2rad(10.0)
     params.max_angvel_cmd[:] = (max_ang, max_ang, max_ang)
 
     # Inner (rate) PID
-    params.rate_kp[:] = (1.0, 1.0, 1.0)
+    params.rate_kp[:] = (6.0, 6.0, 6.0)
     params.rate_ki[:] = (0.0, 0.0, 0.0)
     params.rate_kd[:] = (0.0, 0.0, 0.0)
 
