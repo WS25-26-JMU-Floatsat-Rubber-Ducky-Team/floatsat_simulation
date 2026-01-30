@@ -1,22 +1,8 @@
-#ifndef CONTROL_H
-#define CONTROL_H
+#ifndef ATTITUDE_CONTROL_H
+#define ATTITUDE_CONTROL_H
 
+#include "attitude_types.h"
 #include <stdint.h>
-
-/* =========================
- * Basic math types
- * ========================= */
-
-typedef struct {
-    float w;
-    float x;
-    float y;
-    float z;
-} quat_t;
-
-typedef struct {
-    float v[3];
-} vec3_t;
 
 /* =========================
  * PID state
@@ -81,4 +67,4 @@ vec3_t control_step(
     float                 omega_body_z_cmd // Z spin relative to body frame
 );
 
-#endif /* CONTROL_H */
+#endif /* ATTITUDE_CONTROL_H */

@@ -1,4 +1,4 @@
-#include "control.h"
+#include "attitude_control.h"
 #include <math.h>
 
 /* =========================

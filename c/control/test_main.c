@@ -1,7 +1,8 @@
 #include <stdio.h>
 #include <math.h>
 
-#include "control.h"
+#include "attitude_control.h"
+#include "attitude_estimator.h"
 
 /* Helper: degrees to radians */
 static float deg2rad(float deg)
@@ -80,16 +81,33 @@ int main(void)
     control_init(&ctrl_state, &params);
 
     /* =========================
+     * Estimator state
+     * ========================= */
+
+    meas_state_t meas_state;
+    measurement_init(&meas_state);
+
+    /* =========================
      * Example inputs
      * ========================= */
 
-    /* Current attitude: identity quaternion */
-    quat_t q_current = {
-        .w = 1.0f,
-        .x = 0.0f,
-        .y = 0.0f,
-        .z = 0.0f
-    };
+    /* Estimator input */
+    imu_raw_t imu = {0};
+    measurement_t meas = {0};
+
+    imu.gyro.v[0] = 0.0f;
+    imu.gyro.v[1] = 0.0f;
+    imu.gyro.v[2] = 0.0f;
+
+    /* Accel sees gravity "down" in body frame */
+    imu.acc.v[0] = 0.0f;
+    imu.acc.v[1] = 0.0f;
+    imu.acc.v[2] = -9.81f;
+
+    /* Magnetic field (arbitrary normalized vector) */
+    imu.mag.v[0] = 0.3f;
+    imu.mag.v[1] = 0.0f;
+    imu.mag.v[2] = 0.5f;
 
     /* Setpoint: 10 deg yaw */
     float yaw = deg2rad(10.0f);
@@ -100,10 +118,8 @@ int main(void)
         .z = sinf(yaw * 0.5f)
     };
 
-    /* Measured angular velocity (gyro) */
-    vec3_t omega_meas = {
-        .v = { 0.0f, 0.0f, 0.0f }
-    };
+    /* Optional spin command */
+    float omega_body_z_cmd = 0.0f;
 
     /* Output */
     vec3_t motor_rpm = {0};
@@ -111,18 +127,22 @@ int main(void)
     /* =========================
      * Run one control step
      * ========================= */
+    meas = measurement_update(&meas_state, &imu, params.dt);
+
     motor_rpm = control_step(
         &ctrl_state,
         &params,
-        &q_current,
+        &meas.q,
         &q_setpoint,
-        &omega_meas
+        &meas.omega,
+        omega_body_z_cmd
     );
 
     /* =========================
      * Print result
      * ========================= */
-
+    printf("Estimated quaternion: w=%.4f x=%.4f y=%.4f z=%.4f\n",
+           meas.q.w, meas.q.x, meas.q.y, meas.q.z);
     printf("Motor RPM outputs:\n");
     printf("  Motor 0: %.3f RPM\n", motor_rpm.v[0]);
     printf("  Motor 1: %.3f RPM\n", motor_rpm.v[1]);
