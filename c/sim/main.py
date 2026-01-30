@@ -5,6 +5,8 @@ import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
 import numpy as np
 from mpl_toolkits.mplot3d import Axes3D
+import signal
+import sys
 
 # =========================
 # Load shared library
@@ -151,231 +153,194 @@ def motor_rpm_to_torque(motor_rpm: Vec3, params: ControlParams):
         rpm = motor_rpm.v[i]
         torque = (rpm / params.max_motor_rpm) * params.max_motor_torque
 
-        tau[0] += torque * params.wheel_axis[i][0]
-        tau[1] += torque * params.wheel_axis[i][1]
-        tau[2] += torque * params.wheel_axis[i][2]
+        tau[0] -= torque * params.wheel_axis[i][0]
+        tau[1] -= torque * params.wheel_axis[i][1]
+        tau[2] -= torque * params.wheel_axis[i][2]
 
     return tau
 
 def deg2rad(deg: float) -> float:
     return deg * math.pi / 180.0
 
-def setup_plot():
-    fig, ax = plt.subplots(2, 1, figsize=(10, 6))
-    plt.subplots_adjust(left=0.25, bottom=0.25)
+# Helper for numpy quaternion multiplication
+def quat_np_mul(a, b):
+    w = a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3]
+    x = a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2]
+    y = a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1]
+    z = a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0]
+    return np.array([w, x, y, z])
 
-    # Initialize empty lists for plotting
-    time_line = []
-    yaw_line, pitch_line, roll_line = [], [], []
-    yaw_sp_line, pitch_sp_line, roll_sp_line = [], [], []
-    omega_line = [[], [], []]  # motor RPM
+# =========================
+# Simulation plotting & visualization
+# =========================
 
-    # Attitude plot
-    att_plot_yaw,   = ax[0].plot(time_line, yaw_line, 'r', label='Yaw')
-    att_plot_pitch, = ax[0].plot(time_line, pitch_line, 'g', label='Pitch')
-    att_plot_roll,  = ax[0].plot(time_line, roll_line, 'b', label='Roll')
+class SimulationPlot:
+    """Handles 2D attitude and motor plots."""
+    def __init__(self, max_time_window=30.0):
+        self.max_time_window = max_time_window
 
-    sp_plot_yaw,   = ax[0].plot(time_line, yaw_sp_line,   'r--', label='Yaw SP')
-    sp_plot_pitch, = ax[0].plot(time_line, pitch_sp_line, 'g--', label='Pitch SP')
-    sp_plot_roll,  = ax[0].plot(time_line, roll_sp_line,  'b--', label='Roll SP')
+        self.fig, self.ax = plt.subplots(2, 1, figsize=(10, 6))
+        plt.subplots_adjust(left=0.25, bottom=0.25)
 
-    ax[0].set_ylabel('Angle [deg]')
-    ax[0].set_ylim(-100, 100)
-    ax[0].legend()
-    ax[0].grid(True)
+        # Initialize empty data buffers
+        self.time_line = []
+        self.yaw_line = []
+        self.pitch_line = []
+        self.roll_line = []
+        self.yaw_sp_line = []
+        self.pitch_sp_line = []
+        self.roll_sp_line = []
+        self.omega_line = [[], [], []]
 
-    # Motor RPM plot (bottom)
-    rpm_plot_lines = [ax[1].plot(time_line, omega_line[i], label=f'Motor {i}')[0] for i in range(3)]
-    ax[1].set_ylabel('Motor RPM')
-    ax[1].set_xlabel('Time [s]')
-    ax[1].set_ylim(-1000, 1000)
-    ax[1].legend()
-    ax[1].grid(True)
+        # Attitude lines
+        self.att_plots = [
+            self.ax[0].plot([], [], 'r', label='Yaw')[0],
+            self.ax[0].plot([], [], 'g', label='Pitch')[0],
+            self.ax[0].plot([], [], 'b', label='Roll')[0],
+        ]
+        self.sp_plots = [
+            self.ax[0].plot([], [], 'r--', label='Yaw SP')[0],
+            self.ax[0].plot([], [], 'g--', label='Pitch SP')[0],
+            self.ax[0].plot([], [], 'b--', label='Roll SP')[0],
+        ]
+        self.ax[0].set_ylabel("Angle [deg]")
+        self.ax[0].set_ylim(-100, 100)
+        self.ax[0].legend()
+        self.ax[0].grid(True)
 
-    return (fig, ax,
-            att_plot_yaw, att_plot_pitch, att_plot_roll,
-            sp_plot_yaw, sp_plot_pitch, sp_plot_roll,
-            rpm_plot_lines,
-            time_line, yaw_line, pitch_line, roll_line,
-            yaw_sp_line, pitch_sp_line, roll_sp_line,
-            omega_line)
+        # Motor RPM lines
+        self.rpm_plot_lines = [self.ax[1].plot([], [], label=f'Motor {i}')[0] for i in range(3)]
+        self.ax[1].set_ylabel("Motor RPM")
+        self.ax[1].set_xlabel("Time [s]")
+        self.ax[1].set_ylim(-1000, 1000)
+        self.ax[1].legend()
+        self.ax[1].grid(True)
+
+    def update(self, t, angles_deg, sp_angles_deg, motor_rpm: Vec3):
+        yaw, pitch, roll = angles_deg
+        yaw_sp, pitch_sp, roll_sp = sp_angles_deg
+
+        self.time_line.append(t)
+        self.yaw_line.append(yaw)
+        self.pitch_line.append(pitch)
+        self.roll_line.append(roll)
+        self.yaw_sp_line.append(yaw_sp)
+        self.pitch_sp_line.append(pitch_sp)
+        self.roll_sp_line.append(roll_sp)
+        for i in range(3):
+            self.omega_line[i].append(motor_rpm.v[i])
+
+        # Remove old data outside window
+        while self.time_line and self.time_line[-1] - self.time_line[0] > self.max_time_window:
+            self.time_line.pop(0)
+            self.yaw_line.pop(0)
+            self.pitch_line.pop(0)
+            self.roll_line.pop(0)
+            self.yaw_sp_line.pop(0)
+            self.pitch_sp_line.pop(0)
+            self.roll_sp_line.pop(0)
+            for i in range(3):
+                self.omega_line[i].pop(0)
+
+        # Update plots
+        for plot, data in zip(self.att_plots, [self.yaw_line, self.pitch_line, self.roll_line]):
+            plot.set_data(self.time_line, data)
+        for plot, data in zip(self.sp_plots, [self.yaw_sp_line, self.pitch_sp_line, self.roll_sp_line]):
+            plot.set_data(self.time_line, data)
+        for i, plot in enumerate(self.rpm_plot_lines):
+            plot.set_data(self.time_line, self.omega_line[i])
+
+        # Autoscale
+        for ax in self.ax:
+            ax.relim()
+            ax.autoscale_view()
+
 
 def setup_sliders(fig, initial_yaw=0.0, initial_pitch=0.0, initial_roll=0.0):
     axcolor = 'lightgoldenrodyellow'
     ax_pitch = plt.axes([0.25, 0.10, 0.65, 0.03], facecolor=axcolor)
     ax_roll  = plt.axes([0.25, 0.15, 0.65, 0.03], facecolor=axcolor)
     ax_yaw   = plt.axes([0.25, 0.05, 0.65, 0.03], facecolor=axcolor)
-    ax_omega = plt.axes([0.25, 0.20, 0.65, 0.03], facecolor=axcolor)  # new slider
+    ax_omega = plt.axes([0.25, 0.20, 0.65, 0.03], facecolor=axcolor)
 
     pitch_slider = Slider(ax_pitch, 'Pitch', -90.0, 90.0, valinit=initial_pitch)
     roll_slider  = Slider(ax_roll, 'Roll', -90.0, 90.0, valinit=initial_roll)
     yaw_slider   = Slider(ax_yaw, 'Yaw', -90.0, 90.0, valinit=initial_yaw)
-    omega_z_slider = Slider(ax_omega, 'Body Z rot', -90.0, 90.0, valinit=0.0)  # deg/s
+    omega_z_slider = Slider(ax_omega, 'Body Z rot', -90.0, 90.0, valinit=0.0)
 
     return yaw_slider, pitch_slider, roll_slider, omega_z_slider
 
-def setup_3d_visualization(cube_size=0.2):
-    fig_3d = plt.figure(figsize=(6,6))
-    ax3d = fig_3d.add_subplot(111, projection='3d')
-    ax3d.set_xlim([-1,1])
-    ax3d.set_ylim([-1,1])
-    ax3d.set_zlim([-1,1])
-    ax3d.set_xlabel('X')
-    ax3d.set_ylabel('Y')
-    ax3d.set_zlabel('Z')
-    ax3d.set_box_aspect([1,1,1])
 
-    cube_vertices = np.array([
-        [-1,-1,-1],[ 1,-1,-1],[ 1, 1,-1],[-1, 1,-1],
-        [-1,-1, 1],[ 1,-1, 1],[ 1, 1, 1],[-1, 1, 1],
-    ], dtype=float) * cube_size
+class Cube3D:
+    """3D cube and body axes visualization."""
+    def __init__(self, cube_size=0.2):
+        self.fig = plt.figure(figsize=(6,6))
+        self.ax = self.fig.add_subplot(111, projection='3d')
+        self.ax.set_xlim([-1,1])
+        self.ax.set_ylim([-1,1])
+        self.ax.set_zlim([-1,1])
+        self.ax.set_box_aspect([1,1,1])
+        self.ax.set_xlabel('X')
+        self.ax.set_ylabel('Y')
+        self.ax.set_zlabel('Z')
 
-    cube_edges = [
-        (0,1),(1,2),(2,3),(3,0),
-        (4,5),(5,6),(6,7),(7,4),
-        (0,4),(1,5),(2,6),(3,7)
-    ]
+        self.vertices = np.array([
+            [-1,-1,-1],[ 1,-1,-1],[ 1, 1,-1],[-1, 1,-1],
+            [-1,-1, 1],[ 1,-1, 1],[ 1, 1, 1],[-1, 1, 1],
+        ], dtype=float) * cube_size
 
-    cube_lines = []
-    for e in cube_edges:
-        line, = ax3d.plot(
-            cube_vertices[[e[0], e[1]],0],
-            cube_vertices[[e[0], e[1]],1],
-            cube_vertices[[e[0], e[1]],2],
-            'b'
-        )
-        cube_lines.append(line)
+        self.edges = [
+            (0,1),(1,2),(2,3),(3,0),
+            (4,5),(5,6),(6,7),(7,4),
+            (0,4),(1,5),(2,6),(3,7)
+        ]
+        # Draw cube edges
+        self.lines = [self.ax.plot(self.vertices[[e[0], e[1]],0],
+                                   self.vertices[[e[0], e[1]],1],
+                                   self.vertices[[e[0], e[1]],2], 'b')[0] for e in self.edges]
 
-    # --- Body axes arrows (start along unit axes) ---
-    axis_length = cube_size * 2.0
-    body_axes = np.eye(3) * axis_length  # X,Y,Z basis vectors
+        # Body axes
+        axis_length = cube_size * 2.0
+        self.body_axes = np.eye(3) * axis_length
+        self.quivers = [
+            self.ax.quiver(0,0,0, *self.body_axes[0], color='r'),
+            self.ax.quiver(0,0,0, *self.body_axes[1], color='g'),
+            self.ax.quiver(0,0,0, *self.body_axes[2], color='b'),
+        ]
 
-    quivers = [
-        ax3d.quiver(0,0,0, body_axes[0,0], body_axes[0,1], body_axes[0,2], color='r'),
-        ax3d.quiver(0,0,0, body_axes[1,0], body_axes[1,1], body_axes[1,2], color='g'),
-        ax3d.quiver(0,0,0, body_axes[2,0], body_axes[2,1], body_axes[2,2], color='b'),
-    ]
+    @staticmethod
+    def rotate_vectors(vectors, q: Quat):
+        """Rotate vectors by quaternion."""
+        qv = np.array([q.w, q.x, q.y, q.z])
+        qc = np.array([q.w, -q.x, -q.y, -q.z])
+        rotated = []
+        for v in vectors:
+            vq = np.array([0.0, *v])
+            vr = quat_np_mul(quat_np_mul(qv, vq), qc)
+            rotated.append(vr[1:])
+        return np.array(rotated)
 
-    return fig_3d, ax3d, cube_lines, cube_vertices, cube_edges, quivers
+    @staticmethod
+    def rotate_cube(vertices, q: Quat):
+        return Cube3D.rotate_vectors(vertices, q)
 
-def rotate_vectors(vectors, q: Quat):
-    qv = np.array([q.w, q.x, q.y, q.z])
-
-    def quat_mul(a, b):
-        return np.array([
-            a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3],
-            a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2],
-            a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1],
-            a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0]
-        ])
-
-    qc = np.array([qv[0], -qv[1], -qv[2], -qv[3]])
-
-    rotated = []
-    for v in vectors:
-        vq = np.array([0.0, *v])
-        vr = quat_mul(quat_mul(qv, vq), qc)
-        rotated.append(vr[1:])
-    return np.array(rotated)
-
-def rotate_cube(vertices, q: Quat):
-    """
-    Rotate vertices by quaternion q
-    """
-    def quat_mul(a, b):
-        w = a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3]
-        x = a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2]
-        y = a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1]
-        z = a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0]
-        return np.array([w,x,y,z])
-    def quat_conj(qv):
-        return np.array([qv[0], -qv[1], -qv[2], -qv[3]])
-
-    qv = np.array([q.w, q.x, q.y, q.z])
-    qc = quat_conj(qv)
-
-    rotated = []
-    for v in vertices:
-        vq = np.array([0.0, *v])
-        vr = quat_mul(quat_mul(qv, vq), qc)
-        rotated.append(vr[1:])
-    return np.array(rotated)
-
-
-def update_3d_visualization(cube_lines, cube_vertices, cube_edges, quivers, q_current):
-    rotated_vertices = rotate_cube(cube_vertices, q_current)
-
-    # Update cube edges
-    for i, e in enumerate(cube_edges):
-        cube_lines[i].set_data(rotated_vertices[[e[0], e[1]],0],
-                               rotated_vertices[[e[0], e[1]],1])
-        cube_lines[i].set_3d_properties(rotated_vertices[[e[0], e[1]],2])
-
-    # --- Rotate body axes ---
-    axis_length = np.linalg.norm(cube_vertices[0]) * 2
-    body_axes = np.eye(3) * axis_length
-    rotated_axes = rotate_vectors(body_axes, q_current)
-
-    # Remove old arrows
-    for q in quivers:
-        q.remove()
-
-    ax = cube_lines[0].axes
-
-    # Draw new arrows
-    quivers[0] = ax.quiver(0,0,0, *rotated_axes[0], color='r')
-    quivers[1] = ax.quiver(0,0,0, *rotated_axes[1], color='g')
-    quivers[2] = ax.quiver(0,0,0, *rotated_axes[2], color='b')
-
-    plt.draw()
-
-def update_plot(att_plots, sp_plots, rpm_plot_lines,
-                time_line, yaw_line, pitch_line, roll_line,
-                yaw_sp_line, pitch_sp_line, roll_sp_line,
-                omega_line, t, angles_deg, sp_angles_deg, motor_rpm,
-                max_time_window=30.0):
-
-    yaw, pitch, roll = angles_deg
-    yaw_sp, pitch_sp, roll_sp = sp_angles_deg
-
-    # Append new data
-    time_line.append(t)
-    yaw_line.append(yaw)
-    pitch_line.append(pitch)
-    roll_line.append(roll)
-    yaw_sp_line.append(yaw_sp)
-    pitch_sp_line.append(pitch_sp)
-    roll_sp_line.append(roll_sp)
-    for i in range(3):
-        omega_line[i].append(motor_rpm.v[i])
-
-    # Remove old data outside the window
-    while time_line and time_line[-1] - time_line[0] > max_time_window:
-        time_line.pop(0)
-        yaw_line.pop(0)
-        pitch_line.pop(0)
-        roll_line.pop(0)
-        yaw_sp_line.pop(0)
-        pitch_sp_line.pop(0)
-        roll_sp_line.pop(0)
-        for i in range(3):
-            omega_line[i].pop(0)
-
-    # Update lines
-    att_plots[0].set_data(time_line, yaw_line)
-    att_plots[1].set_data(time_line, pitch_line)
-    att_plots[2].set_data(time_line, roll_line)
-    sp_plots[0].set_data(time_line, yaw_sp_line)
-    sp_plots[1].set_data(time_line, pitch_sp_line)
-    sp_plots[2].set_data(time_line, roll_sp_line)
-
-    for i in range(3):
-        rpm_plot_lines[i].set_data(time_line, omega_line[i])
-
-    # Adjust axes dynamically
-    for ax in att_plots[0].axes.figure.axes[:2]:  # first subplot is attitude
-        ax.relim()
-        ax.autoscale_view()
+    def update(self, q: Quat):
+        rotated_vertices = self.rotate_cube(self.vertices, q)
+        # Update edges
+        for i, e in enumerate(self.edges):
+            self.lines[i].set_data(rotated_vertices[[e[0], e[1]],0],
+                                   rotated_vertices[[e[0], e[1]],1])
+            self.lines[i].set_3d_properties(rotated_vertices[[e[0], e[1]],2])
+        # Update axes
+        rotated_axes = self.rotate_vectors(self.body_axes, q)
+        for qv in self.quivers:
+            qv.remove()
+        self.quivers = [
+            self.ax.quiver(0,0,0, *rotated_axes[0], color='r'),
+            self.ax.quiver(0,0,0, *rotated_axes[1], color='g'),
+            self.ax.quiver(0,0,0, *rotated_axes[2], color='b'),
+        ]
+        plt.draw()
 
 # =========================
 # Main logic
@@ -383,18 +348,15 @@ def update_plot(att_plots, sp_plots, rpm_plot_lines,
 
 def main():
     # -------------------------
-    # Control parameters
+    # Initialize control parameters
     # -------------------------
-
     params = ControlParams()
-
-    params.dt = 0.05  # 500 Hz
+    params.dt = 0.05  # 20 Hz for simulation
 
     # Outer (angle) PID
     params.angle_kp[:] = (1.0, 1.0, 1.0)
     params.angle_ki[:] = (0.0, 0.0, 0.0)
     params.angle_kd[:] = (1.0, 1.0, 1.0)
-
     max_ang = deg2rad(10.0)
     params.max_angvel_cmd[:] = (max_ang, max_ang, max_ang)
 
@@ -409,143 +371,105 @@ def main():
 
     # Wheel axis matrix
     params.wheel_axis[0][:] = (0.8165, -0.4083, 0.4083)
-    params.wheel_axis[1][:] = (0.0,     0.7071, -0.07071)
-    params.wheel_axis[2][:] = (0.5773,  0.5773,  0.5773)
+    params.wheel_axis[1][:] = (0.0, 0.7071, -0.07071)
+    params.wheel_axis[2][:] = (0.5773, 0.5773, 0.5773)
 
     # Virtual actuator mapping
     params.torque_to_rpm = params.max_motor_rpm / params.max_motor_torque
 
     # -------------------------
-    # Control state
+    # Initialize controller state
     # -------------------------
-
     ctrl_state = ControlState()
     lib.control_init(ctypes.byref(ctrl_state), ctypes.byref(params))
 
     # -------------------------
-    # Inputs
+    # Initialize simulation state
     # -------------------------
-
-    q_current = Quat(
-        w=1.0,
-        x=0.0,
-        y=0.0,
-        z=0.0,
-    )
-
-    yaw = deg2rad(10.0)
-    q_setpoint = Quat(
-        w=math.cos(yaw * 0.5),
-        x=0.0,
-        y=0.0,
-        z=math.sin(yaw * 0.5),
-    )
-
+    q_current = Quat(1.0, 0.0, 0.0, 0.0)
+    omega = [0.0, 0.0, 0.0]  # Body rates [rad/s]
+    I = [1.0, 1.0, 1.0]      # Diagonal inertia
+    I_inv = [1.0 / i for i in I]
     omega_meas = Vec3((0.0, 0.0, 0.0))
 
     # -------------------------
-    # Simple plant state
+    # Setup visualization
     # -------------------------
+    sim_plot = SimulationPlot(max_time_window=30.0)
+    yaw_slider, pitch_slider, roll_slider, omega_z_slider = setup_sliders(sim_plot.fig)
+    cube3d = Cube3D()
 
-    omega = [0.0, 0.0, 0.0]   # body angular velocity [rad/s]
-
-    # Diagonal inertia
-    I = [1.0, 1.0, 1.0]
-    I_inv = [1.0 / I[0], 1.0 / I[1], 1.0 / I[2]]
-
-    (fig, ax,
-     att_plot_yaw, att_plot_pitch, att_plot_roll,
-     sp_plot_yaw, sp_plot_pitch, sp_plot_roll,
-     rpm_plot_lines,
-     time_line, yaw_line, pitch_line, roll_line,
-     yaw_sp_line, pitch_sp_line, roll_sp_line,
-     omega_line) = setup_plot()
-    yaw_slider, pitch_slider, roll_slider, omega_z_slider = setup_sliders(fig, initial_yaw=0.0, initial_pitch=0.0, initial_roll=0.0)
-    fig3d, ax3d, cube_lines, cube_vertices, cube_edges, quivers = setup_3d_visualization()
-
-    # Continuous loop with matplotlib interactive mode
     plt.ion()
     plt.show()
 
+    # -------------------------
+    # Simulation loop
+    # -------------------------
     t = 0.0
     dt = params.dt
-
     print("Running simulation...")
 
-    while True:
-        # --- Read setpoints ---
+    while plt.fignum_exists(sim_plot.fig.number) and plt.fignum_exists(cube3d.fig.number):
+        # --- Read user setpoints ---
         roll_deg  = roll_slider.val
         pitch_deg = pitch_slider.val
         yaw_deg   = yaw_slider.val
-        omega_z_speed = omega_z_slider.val
+        omega_z_deg = omega_z_slider.val
 
         roll_rad  = deg2rad(roll_deg)
         pitch_rad = deg2rad(pitch_deg)
         yaw_rad   = deg2rad(yaw_deg)
-        omega_z_speed_rad = deg2rad(omega_z_speed)
+        omega_z_rad = deg2rad(omega_z_deg)
 
         q_setpoint = euler_to_quat(roll_rad, pitch_rad, yaw_rad)
 
         # --- Controller ---
         omega_meas.v[:] = omega
-
         motor_rpm = lib.control_step(
             ctypes.byref(ctrl_state),
             ctypes.byref(params),
             ctypes.byref(q_current),
             ctypes.byref(q_setpoint),
             ctypes.byref(omega_meas),
-            c_float(omega_z_speed_rad),
+            c_float(omega_z_rad),
         )
 
-        # print(motor_rpm.v[0],motor_rpm.v[1], motor_rpm.v[2])
-
-        # --- Plant ---
-        tau_from_wheels = [0.0, 0.0, 0.0]
-        for i in range(3):
-            torque = (motor_rpm.v[i] / params.max_motor_rpm) * params.max_motor_torque
-            tau_from_wheels[0] -= torque * params.wheel_axis[i][0]
-            tau_from_wheels[1] -= torque * params.wheel_axis[i][1]
-            tau_from_wheels[2] -= torque * params.wheel_axis[i][2]
-
-        # Gyroscopic term
+        # --- Simple plant integration ---
+        tau = motor_rpm_to_torque(motor_rpm, params)
+        # Gyroscopic term: omega x (I*omega)
         omega_cross_Iomega = [
             omega[1]*I[2]*omega[2] - omega[2]*I[1]*omega[1],
             omega[2]*I[0]*omega[0] - omega[0]*I[2]*omega[2],
             omega[0]*I[1]*omega[1] - omega[1]*I[0]*omega[0]
         ]
-
-        domega = [(tau_from_wheels[i] - omega_cross_Iomega[i])*I_inv[i] for i in range(3)]
+        domega = [(tau[i] - omega_cross_Iomega[i]) * I_inv[i] for i in range(3)]
         omega = [omega[i] + domega[i]*dt for i in range(3)]
         integrate_quat(q_current, omega, dt)
 
-        # --- Convert current quaternion to Euler angles ---
-        w, x, y, z = q_current.w, q_current.x, q_current.y, q_current.z
-
-        # Roll (x-axis)
-        roll_current  = math.atan2(2*(w*x + y*z), 1 - 2*(x*x + y*y))
-        # Pitch (y-axis)
-        pitch_current = math.asin(max(-1.0, min(1.0, 2*(w*y - z*x))))
-        # Yaw (z-axis)
-        yaw_current   = math.atan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
-
-        angles_deg    = (math.degrees(yaw_current),
-                         math.degrees(pitch_current),
-                         math.degrees(roll_current))
+        # --- Current angles for plotting ---
+        roll_current  = math.atan2(2*(q_current.w*q_current.x + q_current.y*q_current.z),
+                                   1 - 2*(q_current.x**2 + q_current.y**2))
+        pitch_current = math.asin(max(-1.0, min(1.0, 2*(q_current.w*q_current.y - q_current.z*q_current.x))))
+        yaw_current   = math.atan2(2*(q_current.w*q_current.z + q_current.x*q_current.y),
+                                   1 - 2*(q_current.y**2 + q_current.z**2))
+        angles_deg = (math.degrees(yaw_current),
+                      math.degrees(pitch_current),
+                      math.degrees(roll_current))
         sp_angles_deg = (yaw_deg, pitch_deg, roll_deg)
 
-        # --- Update plot ---
-        update_plot([att_plot_yaw, att_plot_pitch, att_plot_roll],
-                    [sp_plot_yaw, sp_plot_pitch, sp_plot_roll],
-                    rpm_plot_lines,
-                    time_line, yaw_line, pitch_line, roll_line,
-                    yaw_sp_line, pitch_sp_line, roll_sp_line,
-                    omega_line,
-                    t, angles_deg, sp_angles_deg, motor_rpm)
-        update_3d_visualization(cube_lines, cube_vertices, cube_edges, quivers, q_current)
+        # --- Update plots ---
+        sim_plot.update(t, angles_deg, sp_angles_deg, motor_rpm)
+        cube3d.update(q_current)
 
         plt.pause(dt)
         t += dt
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nSimulation interrupted by user.")
+    finally:
+        import matplotlib.pyplot as plt
+        plt.ioff()
+        plt.close('all')
